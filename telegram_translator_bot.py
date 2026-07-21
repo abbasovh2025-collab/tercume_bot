@@ -5,7 +5,6 @@ import logging
 import re
 import tempfile
 import mimetypes
-import deepl
 from deep_translator import GoogleTranslator
 from datetime import datetime, timezone, timedelta
 from telethon import TelegramClient
@@ -22,9 +21,6 @@ BOT_TOKEN = "8759071197:AAHbp2Ivs64k6OgIXUcEvLO471tEOt6eMRs"
 # əlavə olunmalıdır — bu olmadan CI-da interaktiv login mümkün deyil (EOFError).
 TG_SESSION = os.environ.get("TG_SESSION", "").strip()
 
-# STRIP — whitespace / newline silmək üçün
-DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY", "1c165b1b-3ed6-4d52-9172-6be55b92b1b5:fx").strip()
-
 CHANNELS = [
     {"source": -1001099250240, "target": -1003929029095},
     {"source": -1001111348665, "target": -1003996927324},
@@ -37,24 +33,17 @@ CHANNELS = [
 ]
 
 # === "QIZIL ORTA" — sürət vs spam qorxusu ===
-# Telegram-da eyni kanala göndərmək üçün təhlükəsiz sürət ~1 mesaj/saniyədir.
-# 1.2 saniyə bunu güvənli şəkildə saxlayır, amma real sürətlə işləyir.
-# Bundan əlavə, FloodWaitError tutularsa, bot avtomatik gözləyib YENİDƏN cəhd edir
-# (əvvəlki versiyada sadəcə gözləyib mesajı itirirdi).
 SEND_DELAY = 1.2
 MAX_FLOOD_RETRY = 2
 
-# Bot ilk dəfə bir kanal üçün işə düşəndə nə qədər geriyə baxsın?
 FIRST_RUN_LOOKBACK_MINUTES = 15
 FIRST_RUN_MAX_MESSAGES = 50
 
-# Redaktə/silinmə sinxronizasiyası üçün hər run-da yoxlanılan son mesaj sayı
 EDIT_SYNC_CHECK = 40
-# Yaddaşda saxlanılan mesaj-uyğunluğu qeydlərinin son həddi (kanal başına)
 MSG_MAP_MAX_SIZE = 300
 
 STATE_FILE = "state.json"
-LEGACY_STATE_FILE = "last_ids.txt"  # köhnə versiyanın state faylı (miqrasiya üçün)
+LEGACY_STATE_FILE = "last_ids.txt"
 # ==========================================
 
 logging.basicConfig(
@@ -64,25 +53,14 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-translator = deepl.Translator(DEEPL_API_KEY)
-use_google = False
-
 
 def translate(text: str) -> str:
-    """DeepL ilə tərcümə edir, alınmasa (limit/xəta) avtomatik Google-a keçir."""
-    global use_google
-    if use_google:
-        return GoogleTranslator(source="auto", target="az").translate(text)
+    """Yalnız Google Translate ilə tərcümə edir."""
     try:
-        return translator.translate_text(text, target_lang="AZ").text
-    except deepl.exceptions.QuotaExceededException:
-        use_google = True
-        log.info("⚠️  DeepL limiti bitdi! Google-a keçildi.")
         return GoogleTranslator(source="auto", target="az").translate(text)
     except Exception as e:
-        log.info(f"⚠️  DeepL xətası ({e}), Google-a keçirilir...")
-        use_google = True
-        return GoogleTranslator(source="auto", target="az").translate(text)
+        log.info(f"❌ Google Translate xətası: {e}")
+        return text
 
 
 # ---------- LİNKLƏRİ QORUMA ----------
@@ -168,7 +146,6 @@ def get_channel_state(state: dict, source: int) -> dict:
 
 
 def migrate_legacy_state(state: dict):
-    """Köhnə last_ids.txt formatından state.json-a keçid (proqres itməsin)."""
     if os.path.exists(LEGACY_STATE_FILE):
         with open(LEGACY_STATE_FILE, "r") as f:
             for line in f:
@@ -203,7 +180,6 @@ bot_client  = TelegramClient("bot_session",  API_ID, API_HASH, connection=Connec
 
 
 async def send_safe(source_msg, translated_text: str, target: int, _retry: int = 0):
-    """Uğur olarsa göndərilmiş Telegram Message obyektini, olmazsa None qaytarır."""
     media = source_msg.media
     web_url = None
     temp_path = None
@@ -307,7 +283,6 @@ async def send_safe(source_msg, translated_text: str, target: int, _retry: int =
 
 
 async def sync_edits_and_deletes(source: int, target: int, state: dict):
-    """Orijinal kanalda silinən/redaktə edilən mesajları hədəf kanalda da sinxronlaşdırır."""
     ch = get_channel_state(state, source)
     if not ch["msgs"]:
         return
@@ -331,7 +306,6 @@ async def sync_edits_and_deletes(source: int, target: int, state: dict):
             continue
 
         if msg is None:
-            # orijinal kanalda mesaj silinib -> hədəf kanalda da silinsin
             try:
                 await bot_client.delete_messages(target, entry["tid"])
                 log.info(f"🗑️  Silindi (mənbə ID: {src_id})")
@@ -352,8 +326,6 @@ async def sync_edits_and_deletes(source: int, target: int, state: dict):
                     log.info(f"✏️  Redaktə sinxronlaşdırıldı (mənbə ID: {src_id})")
                 entry["ed"] = new_ed
             except Exception as e:
-                # Qeyd: media faylının özünü (video/şəkil) əvəz edən redaktələr dəstəklənmir,
-                # yalnız mətn/caption dəyişiklikləri sinxronlaşdırılır.
                 log.info(f"❌ Redaktə sinxronizasiya xətası (ID: {src_id}): {e}")
 
 
@@ -361,7 +333,6 @@ async def process_channel(source: int, target: int, state: dict):
     log.info(f"\n📡 {source} → {target}")
     ch = get_channel_state(state, source)
 
-    # 1) Əvvəlcə silinmə/redaktə sinxronizasiyası
     await sync_edits_and_deletes(source, target, state)
     save_state(state)
 
@@ -374,7 +345,7 @@ async def process_channel(source: int, target: int, state: dict):
         async for msg in user_client.iter_messages(source, limit=FIRST_RUN_MAX_MESSAGES, reverse=False):
             if not msg.action and (msg.text or msg.media) and msg.date > cutoff:
                 messages.append(msg)
-        messages.reverse()  # köhnədən yeniyə — orijinal kanaldakı ardıcıllıqla
+        messages.reverse()
 
         last_sent_id = 0
         async for msg in user_client.iter_messages(source, limit=1):

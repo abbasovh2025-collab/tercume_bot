@@ -11,6 +11,10 @@ from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from telethon.network import ConnectionTcpIntermediate
 from telethon.sessions import StringSession
+from zoneinfo import ZoneInfo
+
+# Telegram mesajların vaxtını UTC saxlayır — çap edərkən Bakı vaxtına çeviririk
+LOCAL_TZ = ZoneInfo("Asia/Baku")
 
 # ==========================================
 API_ID    = 39644223
@@ -319,7 +323,7 @@ async def sync_edits_and_deletes(source: int, target: int, state: dict):
             try:
                 text = clean_text(msg.text or "")
                 translated = translate_preserving_links(msg, text) if text else ""
-                date_str = msg.date.strftime("%d.%m.%Y %H:%M")
+                date_str = msg.date.astimezone(LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
                 final_text = f"{translated}\n\n📅 {date_str} (redaktə edilib)" if translated else None
                 if final_text:
                     await bot_client.edit_message(target, entry["tid"], final_text, link_preview=False)
@@ -358,7 +362,7 @@ async def process_channel(source: int, target: int, state: dict):
             try:
                 text = clean_text(msg.text or "")
                 translated = translate_preserving_links(msg, text) if text else ""
-                date_str = msg.date.strftime("%d.%m.%Y %H:%M")
+                date_str = msg.date.astimezone(LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
                 final_text = f"{translated}\n\n📅 {date_str}" if translated else ""
                 sent = await send_safe(msg, final_text, target)
                 if sent:
@@ -383,7 +387,7 @@ async def process_channel(source: int, target: int, state: dict):
         try:
             text = clean_text(msg.text or "")
             translated = translate_preserving_links(msg, text) if text else ""
-            date_str = msg.date.strftime("%d.%m.%Y %H:%M")
+            date_str = msg.date.astimezone(LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
             final_text = f"{translated}\n\n📅 {date_str}" if translated else ""
 
             sent = await send_safe(msg, final_text, target)

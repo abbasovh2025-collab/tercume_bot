@@ -2,14 +2,15 @@ name: Telegram Translator Bot
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '17,47 * * * *'
   workflow_dispatch:
+  repository_dispatch:
+    types: [trigger-bot]
 
 concurrency:
   group: telegram-bot
   cancel-in-progress: false
 
-# BUG FIX: bunsuz GITHUB_TOKEN read-only ola bilər və "git push" 403 ilə uğursuz olar.
 permissions:
   contents: write
 
@@ -36,10 +37,6 @@ jobs:
           TG_SESSION: ${{ secrets.TG_SESSION }}
         run: python telegram_translator_bot.py
 
-      # BUG FIX: if: always() olmasa, bot.py xəta ilə dayansa state heç saxlanmır.
-      # QEYD: *.session artıq git-ə commit olunmur — user_client indi TG_SESSION
-      # secret-indən (StringSession) login olur, bot_client isə bot token ilə hər
-      # run-da yenidən (heç bir promptsuz) avtomatik login olur.
       - name: Persist state
         if: always()
         run: |
@@ -49,6 +46,3 @@ jobs:
           git diff --cached --quiet || git commit -m "state yeniləndi [skip ci]"
           git pull --rebase --autostash || true
           git push
-
-
-

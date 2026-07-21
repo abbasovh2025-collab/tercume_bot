@@ -1,0 +1,45 @@
+name: Telegram Translator Bot
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # hər 30 dəqiqədən bir (GitHub-un texniki minimumu 5 dəqiqədir,
+                              # amma "qızıl orta" üçün aşağıdakı izaha bax)
+  workflow_dispatch:          # istəsəniz əl ilə də işə sala bilərsiniz
+
+# Əvvəlki run hələ bitməyibsə, YENİ run onu YARIMÇIQ kəsmək əvəzinə növbəyə düşür.
+# Bu, eyni mesajın 2 dəfə göndərilməsinin (overlap-dan yaranan spam) qarşısını alır.
+concurrency:
+  group: telegram-bot
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install telethon deepl deep-translator
+
+      - name: Run bot
+        env:
+          DEEPL_API_KEY: ${{ secrets.DEEPL_API_KEY }}
+        run: python telegram_translator_bot.py
+
+      # state.json (last_id + mesaj uyğunluq xəritəsi) və sessiya faylları
+      # dəyişibsə, geri repoya commit olunur ki, növbəti run "sıfırdan" başlamasın.
+      - name: Persist state
+        run: |
+          git config user.name "telegram-bot"
+          git config user.email "telegram-bot@users.noreply.github.com"
+          git add state.json bot.log *.session 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "state yeniləndi [skip ci]"
+          git push

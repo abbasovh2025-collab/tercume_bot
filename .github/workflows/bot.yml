@@ -26,9 +26,6 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        run: pip install telethon deepl deep-translator
-
       - name: Run bot
         env:
           DEEPL_API_KEY: ${{ secrets.DEEPL_API_KEY }}

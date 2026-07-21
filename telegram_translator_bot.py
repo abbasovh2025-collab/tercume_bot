@@ -5,18 +5,25 @@ import logging
 import re
 import tempfile
 import mimetypes
+import deepl
 from deep_translator import GoogleTranslator
 from datetime import datetime, timezone, timedelta
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from telethon.network import ConnectionTcpIntermediate
+from telethon.sessions import StringSession
 
 # ==========================================
 API_ID    = 39644223
 API_HASH  = "ceb32e1fd32532a6771756556cc617a2"
 BOT_TOKEN = "8759071197:AAHbp2Ivs64k6OgIXUcEvLO471tEOt6eMRs"
 
+# generate_session.py ilə BİR DƏFƏ yaradılıb GitHub Secrets-ə (TG_SESSION adı ilə)
+# əlavə olunmalıdır — bu olmadan CI-da interaktiv login mümkün deyil (EOFError).
+TG_SESSION = os.environ.get("TG_SESSION", "").strip()
+
 # STRIP — whitespace / newline silmək üçün
+DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY", "1c165b1b-3ed6-4d52-9172-6be55b92b1b5:fx").strip()
 
 CHANNELS = [
     {"source": -1001099250240, "target": -1003929029095},
@@ -57,15 +64,25 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+translator = deepl.Translator(DEEPL_API_KEY)
+use_google = False
 
 
 def translate(text: str) -> str:
-    """Google Translate ilə tərcümə edir."""
+    """DeepL ilə tərcümə edir, alınmasa (limit/xəta) avtomatik Google-a keçir."""
+    global use_google
+    if use_google:
+        return GoogleTranslator(source="auto", target="az").translate(text)
     try:
+        return translator.translate_text(text, target_lang="AZ").text
+    except deepl.exceptions.QuotaExceededException:
+        use_google = True
+        log.info("⚠️  DeepL limiti bitdi! Google-a keçildi.")
         return GoogleTranslator(source="auto", target="az").translate(text)
     except Exception as e:
-        log.info(f"❌ Google Translate xətası: {e}")
-        return text
+        log.info(f"⚠️  DeepL xətası ({e}), Google-a keçirilir...")
+        use_google = True
+        return GoogleTranslator(source="auto", target="az").translate(text)
 
 
 # ---------- LİNKLƏRİ QORUMA ----------
@@ -175,7 +192,13 @@ def remember_message(state: dict, source: int, src_id: int, target_msg, edit_dat
             del ch["msgs"][k]
 
 
-user_client = TelegramClient("user_session", API_ID, API_HASH, connection=ConnectionTcpIntermediate)
+if not TG_SESSION:
+    raise SystemExit(
+        "❌ TG_SESSION tapılmadı. Əvvəlcə generate_session.py-i öz kompüterinizdə işə salıb "
+        "çıxan sətri GitHub Secrets-ə TG_SESSION adı ilə əlavə edin."
+    )
+
+user_client = TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH, connection=ConnectionTcpIntermediate)
 bot_client  = TelegramClient("bot_session",  API_ID, API_HASH, connection=ConnectionTcpIntermediate)
 
 
@@ -427,4 +450,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    

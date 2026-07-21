@@ -5,7 +5,6 @@ import logging
 import re
 import tempfile
 import mimetypes
-import deepl
 from deep_translator import GoogleTranslator
 from datetime import datetime, timezone, timedelta
 from telethon import TelegramClient
@@ -18,7 +17,6 @@ API_HASH  = "ceb32e1fd32532a6771756556cc617a2"
 BOT_TOKEN = "8759071197:AAHbp2Ivs64k6OgIXUcEvLO471tEOt6eMRs"
 
 # STRIP — whitespace / newline silmək üçün
-DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY", "1c165b1b-3ed6-4d52-9172-6be55b92b1b5:fx").strip()
 
 CHANNELS = [
     {"source": -1001099250240, "target": -1003929029095},
@@ -59,25 +57,15 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-translator = deepl.Translator(DEEPL_API_KEY)
-use_google = False
 
 
 def translate(text: str) -> str:
-    """DeepL ilə tərcümə edir, alınmasa (limit/xəta) avtomatik Google-a keçir."""
-    global use_google
-    if use_google:
-        return GoogleTranslator(source="auto", target="az").translate(text)
+    """Google Translate ilə tərcümə edir."""
     try:
-        return translator.translate_text(text, target_lang="AZ").text
-    except deepl.exceptions.QuotaExceededException:
-        use_google = True
-        log.info("⚠️  DeepL limiti bitdi! Google-a keçildi.")
         return GoogleTranslator(source="auto", target="az").translate(text)
     except Exception as e:
-        log.info(f"⚠️  DeepL xətası ({e}), Google-a keçirilir...")
-        use_google = True
-        return GoogleTranslator(source="auto", target="az").translate(text)
+        log.info(f"❌ Google Translate xətası: {e}")
+        return text
 
 
 # ---------- LİNKLƏRİ QORUMA ----------

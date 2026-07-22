@@ -11,6 +11,8 @@ from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from telethon.network import ConnectionTcpIntermediate
 from telethon.sessions import StringSession
+from telethon.helpers import add_surrogate
+from telethon.tl.types import MessageEntityCustomEmoji
 from zoneinfo import ZoneInfo
 
 # Telegram mesajların vaxtını UTC saxlayır — çap edərkən Bakı vaxtına çeviririk
@@ -25,16 +27,20 @@ BOT_TOKEN = "8759071197:AAHbp2Ivs64k6OgIXUcEvLO471tEOt6eMRs"
 # əlavə olunmalıdır — bu olmadan CI-da interaktiv login mümkün deyil (EOFError).
 TG_SESSION = os.environ.get("TG_SESSION", "").strip()
 
+# "src" — kanalın əsas dili. "auto" da işləyir, amma konkret dil yazsanız
+# (rus kanal üçün "ru", ingilis üçün "en") Google Translate-in kontekst
+# səhvləri xeyli azalır. Bilmirsinizsə "auto" saxlayın.
 CHANNELS = [
-    {"source": -1001099250240, "target": -1003929029095},
-    {"source": -1001111348665, "target": -1003996927324},
-    {"source": -1001676275372, "target": -1003756746798},
+    {"source": -1001099250240, "target": -1003929029095, "src": "auto"},
+    {"source": -1001111348665, "target": -1003996927324, "src": "auto"},
+    {"source": -1001676275372, "target": -1003756746798, "src": "auto"},
     # ↓ yeni əlavə olunan kanallar
-    {"source": -1001860107178, "target": -1003987436790},  # geopolitics_prime
-    {"source": -1001330445004, "target": -1004402797222},  # DDrobnitski
-    {"source": -1001626824086, "target": -1004491684666},  # Middle_East_Spectator
-    {"source": -1001478765631, "target": -1003530398509},  # yurasumy
+    {"source": -1001860107178, "target": -1003987436790, "src": "en"},  # geopolitics_prime
+    {"source": -1001330445004, "target": -1004402797222, "src": "ru"},  # DDrobnitski
+    {"source": -1001626824086, "target": -1004491684666, "src": "en"},  # Middle_East_Spectator
+    {"source": -1001478765631, "target": -1003530398509, "src": "ru"},  # yurasumy
 ]
+SOURCE_LANG = {c["source"]: c.get("src", "auto") for c in CHANNELS}
 
 # === "QIZIL ORTA" — sürət vs spam qorxusu ===
 SEND_DELAY = 1.2
@@ -45,6 +51,10 @@ FIRST_RUN_MAX_MESSAGES = 50
 
 EDIT_SYNC_CHECK = 40
 MSG_MAP_MAX_SIZE = 300
+
+# Google Translate-in praktiki simvol limitindən aşağı, təhlükəsiz ölçü
+# (bundan böyük mətnlər hissə-hissə tərcümə olunur ki, yarımçıq kəsilməsin)
+MAX_CHUNK_CHARS = 3500
 
 STATE_FILE = "state.json"
 LEGACY_STATE_FILE = "last_ids.txt"
@@ -58,13 +68,43 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def translate(text: str) -> str:
-    """Yalnız Google Translate ilə tərcümə edir."""
-    try:
-        return GoogleTranslator(source="auto", target="az").translate(text)
-    except Exception as e:
-        log.info(f"❌ Google Translate xətası: {e}")
-        return text
+def translate(text: str, src: str = "auto") -> str:
+    """Google Translate ilə tərcümə edir. Uzun mətnlər limitə görə hissə-hissə
+    tərcümə olunur ki, yarımçıq kəsilmə (bug #3) baş verməsin."""
+    if not text:
+        return ""
+    if len(text) <= MAX_CHUNK_CHARS:
+        try:
+            return GoogleTranslator(source=src, target="az").translate(text)
+        except Exception as e:
+            log.info(f"❌ Google Translate xətası: {e}")
+            return text
+
+    # Uzun mətni sətir sərhədlərinə görə bölürük (sözün ortasından kəsmək olmaz)
+    chunks = []
+    current = ""
+    for line in text.split("\n"):
+        candidate = (current + "\n" + line) if current else line
+        if len(candidate) > MAX_CHUNK_CHARS and current:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+
+    translator_obj = GoogleTranslator(source=src, target="az")
+    translated_chunks = []
+    for chunk in chunks:
+        if not chunk.strip():
+            translated_chunks.append(chunk)
+            continue
+        try:
+            translated_chunks.append(translator_obj.translate(chunk))
+        except Exception as e:
+            log.info(f"❌ Google Translate xətası (hissə): {e}")
+            translated_chunks.append(chunk)
+    return "\n".join(translated_chunks)
 
 
 # ---------- LİNKLƏRİ QORUMA ----------
@@ -99,21 +139,57 @@ def extract_hidden_links(msg) -> list:
     return links
 
 
-def translate_preserving_links(msg, text: str) -> str:
+def extract_custom_emojis(msg):
+    """Premium/custom emojiləri (görünən simvol + document_id) çıxarır."""
+    result = []
+    if getattr(msg, "entities", None) and msg.text:
+        surrogate_text = add_surrogate(msg.text)
+        for e in msg.entities:
+            if type(e).__name__ == "MessageEntityCustomEmoji":
+                try:
+                    char = surrogate_text[e.offset:e.offset + e.length]
+                except Exception:
+                    continue
+                doc_id = getattr(e, "document_id", None)
+                if char and doc_id:
+                    result.append((char, doc_id))
+    return result
+
+
+def translate_preserving_links(msg, text: str, src: str = "auto") -> str:
     if not text:
         return ""
     protected, urls = protect_urls(text)
-    try:
-        translated = translate(protected)
-    except Exception as e:
-        log.info(f"❌ Tərcümə xətası: {e}")
-        translated = protected
+    translated = translate(protected, src=src)
     translated = restore_urls(translated, urls)
 
     hidden = [u for u in extract_hidden_links(msg) if u not in urls]
     if hidden:
         translated += "\n\n🔗 " + "\n🔗 ".join(hidden)
     return translated
+
+
+def build_final_message(msg, translated: str, date_str: str, extra_suffix: str = ""):
+    """Tərcümə olunmuş mətni, tarixi və premium emojiləri birləşdirib
+    (mətn, formatting_entities) tuple-i qaytarır."""
+    body = f"{translated}\n\n📅 {date_str}{extra_suffix}" if translated else ""
+    if not body:
+        return body, None
+
+    emojis = extract_custom_emojis(msg)
+    entities = []
+    if emojis:
+        base_surrogate = add_surrogate(body)
+        offset = len(base_surrogate) + 1  # sonuna boşluqla başlayır
+        pieces = []
+        for char, doc_id in emojis:
+            pieces.append(char)
+            length = len(char)
+            entities.append(MessageEntityCustomEmoji(offset=offset, length=length, document_id=doc_id))
+            offset += length + 1  # ayırıcı boşluq
+        body = body + " " + " ".join(pieces)
+
+    return body, (entities or None)
 
 
 def clean_text(text: str) -> str:
@@ -173,6 +249,13 @@ def remember_message(state: dict, source: int, src_id: int, target_msg, edit_dat
             del ch["msgs"][k]
 
 
+def already_sent(state: dict, source: int, src_id: int) -> bool:
+    """BUG #4 FIX: last_id nə vəziyyətdə olursa olsun, bu mesaj artıq uğurla
+    göndərilibsə (msgs xəritəsində qeydi varsa), bir daha göndərilmir."""
+    ch = get_channel_state(state, source)
+    return str(src_id) in ch["msgs"]
+
+
 if not TG_SESSION:
     raise SystemExit(
         "❌ TG_SESSION tapılmadı. Əvvəlcə generate_session.py-i öz kompüterinizdə işə salıb "
@@ -183,7 +266,7 @@ user_client = TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH, connec
 bot_client  = TelegramClient("bot_session",  API_ID, API_HASH, connection=ConnectionTcpIntermediate)
 
 
-async def send_safe(source_msg, translated_text: str, target: int, _retry: int = 0):
+async def send_safe(source_msg, final_text: str, entities, target: int, _retry: int = 0):
     media = source_msg.media
     web_url = None
     temp_path = None
@@ -192,7 +275,7 @@ async def send_safe(source_msg, translated_text: str, target: int, _retry: int =
         if hasattr(media, 'webpage') and hasattr(media.webpage, 'url'):
             web_url = media.webpage.url
             if 'telegra.ph' not in web_url and 't.me' not in web_url:
-                translated_text = translated_text + f"\n\n🔗 {web_url}"
+                final_text = final_text + f"\n\n🔗 {web_url}"
         media = None
     elif media and type(media).__name__ in {"MessageMediaUnsupported", "MessageMediaPoll",
                                             "MessageMediaGame", "MessageMediaGeo",
@@ -236,8 +319,9 @@ async def send_safe(source_msg, translated_text: str, target: int, _retry: int =
 
             if not downloaded or not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
                 log.info(f"⚠️  Media endirilmədi (ID: {source_msg.id}), yalnız mətn göndərilir...")
-                if translated_text:
-                    sent = await bot_client.send_message(target, translated_text, link_preview=False)
+                if final_text:
+                    sent = await bot_client.send_message(target, final_text, link_preview=True,
+                                                           formatting_entities=entities)
                     log.info(f"✅  Yalnız text göndərildi (ID: {source_msg.id})")
                     return sent
                 return None
@@ -245,21 +329,23 @@ async def send_safe(source_msg, translated_text: str, target: int, _retry: int =
             size_mb = os.path.getsize(temp_path) / (1024 * 1024)
             if size_mb > 49:
                 log.info(f"⚠️  Fayl çox böyükdür ({size_mb:.1f}MB), yalnız mətn göndərilir (ID: {source_msg.id})")
-                if translated_text:
-                    return await bot_client.send_message(target, translated_text, link_preview=False)
+                if final_text:
+                    return await bot_client.send_message(target, final_text, link_preview=True,
+                                                           formatting_entities=entities)
                 return None
 
             sent = await bot_client.send_file(
                 target,
                 file=temp_path,
-                caption=translated_text[:1024] if translated_text else None,
+                caption=final_text[:1024] if final_text else None,
                 force_document=False,
                 voice_note=is_voice,
                 video_note=is_round,
             )
 
-        elif translated_text:
-            sent = await bot_client.send_message(target, translated_text, link_preview=False)
+        elif final_text:
+            sent = await bot_client.send_message(target, final_text, link_preview=True,
+                                                   formatting_entities=entities)
         else:
             log.info(f"⚠️  Boş mesaj, ötürülür (ID: {source_msg.id})")
             return None
@@ -272,7 +358,7 @@ async def send_safe(source_msg, translated_text: str, target: int, _retry: int =
         log.info(f"⏳ LIMIT: {wait_s} saniyə gözlənilir... (cəhd {_retry + 1})")
         await asyncio.sleep(wait_s)
         if _retry < MAX_FLOOD_RETRY:
-            return await send_safe(source_msg, translated_text, target, _retry=_retry + 1)
+            return await send_safe(source_msg, final_text, entities, target, _retry=_retry + 1)
         log.info(f"❌ Flood limiti dəfələrlə keçdi, mesaj ötürüldü (ID: {source_msg.id})")
         return None
     except Exception as e:
@@ -291,6 +377,7 @@ async def sync_edits_and_deletes(source: int, target: int, state: dict):
     if not ch["msgs"]:
         return
 
+    src_lang = SOURCE_LANG.get(source, "auto")
     ids_to_check = sorted((int(k) for k in ch["msgs"].keys()), reverse=True)[:EDIT_SYNC_CHECK]
     if not ids_to_check:
         return
@@ -322,11 +409,12 @@ async def sync_edits_and_deletes(source: int, target: int, state: dict):
         if new_ed != entry.get("ed"):
             try:
                 text = clean_text(msg.text or "")
-                translated = translate_preserving_links(msg, text) if text else ""
+                translated = translate_preserving_links(msg, text, src=src_lang) if text else ""
                 date_str = msg.date.astimezone(LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
-                final_text = f"{translated}\n\n📅 {date_str} (redaktə edilib)" if translated else None
+                final_text, entities = build_final_message(msg, translated, date_str, extra_suffix=" (redaktə edilib)")
                 if final_text:
-                    await bot_client.edit_message(target, entry["tid"], final_text, link_preview=False)
+                    await bot_client.edit_message(target, entry["tid"], final_text, link_preview=True,
+                                                    formatting_entities=entities)
                     log.info(f"✏️  Redaktə sinxronlaşdırıldı (mənbə ID: {src_id})")
                 entry["ed"] = new_ed
             except Exception as e:
@@ -336,6 +424,7 @@ async def sync_edits_and_deletes(source: int, target: int, state: dict):
 async def process_channel(source: int, target: int, state: dict):
     log.info(f"\n📡 {source} → {target}")
     ch = get_channel_state(state, source)
+    src_lang = SOURCE_LANG.get(source, "auto")
 
     await sync_edits_and_deletes(source, target, state)
     save_state(state)
@@ -359,12 +448,14 @@ async def process_channel(source: int, target: int, state: dict):
 
         log.info(f"📋 {len(messages)} mesaj tapıldı.")
         for msg in messages:
+            if already_sent(state, source, msg.id):
+                continue
             try:
                 text = clean_text(msg.text or "")
-                translated = translate_preserving_links(msg, text) if text else ""
+                translated = translate_preserving_links(msg, text, src=src_lang) if text else ""
                 date_str = msg.date.astimezone(LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
-                final_text = f"{translated}\n\n📅 {date_str}" if translated else ""
-                sent = await send_safe(msg, final_text, target)
+                final_text, entities = build_final_message(msg, translated, date_str)
+                sent = await send_safe(msg, final_text, entities, target)
                 if sent:
                     remember_message(state, source, msg.id, sent, msg.edit_date)
                     if msg.id > ch["last_id"]:
@@ -384,13 +475,16 @@ async def process_channel(source: int, target: int, state: dict):
     log.info(f"📋 {len(messages)} yeni mesaj tapıldı (orijinal ardıcıllıqla göndəriləcək).")
 
     for msg in messages:
+        if already_sent(state, source, msg.id):
+            ch["last_id"] = max(ch["last_id"] or 0, msg.id)
+            continue
         try:
             text = clean_text(msg.text or "")
-            translated = translate_preserving_links(msg, text) if text else ""
+            translated = translate_preserving_links(msg, text, src=src_lang) if text else ""
             date_str = msg.date.astimezone(LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
-            final_text = f"{translated}\n\n📅 {date_str}" if translated else ""
+            final_text, entities = build_final_message(msg, translated, date_str)
 
-            sent = await send_safe(msg, final_text, target)
+            sent = await send_safe(msg, final_text, entities, target)
             if sent:
                 remember_message(state, source, msg.id, sent, msg.edit_date)
                 ch["last_id"] = msg.id

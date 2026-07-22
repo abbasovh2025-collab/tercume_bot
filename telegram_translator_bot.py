@@ -237,10 +237,23 @@ def migrate_legacy_state(state: dict):
         log.info("♻️  Köhnə last_ids.txt formatından state.json-a keçirildi.")
 
 
-def remember_message(state: dict, source: int, src_id: int, target_msg, edit_date):
+def tid_list(entry: dict) -> list:
+    """entry['tid'] həm köhnə formatda (tək int), həm yeni formatda (list)
+    ola bilər — hər iki halı dəstəkləyir (bug #3 fix-i üçün mesaj 2 hissəyə
+    bölünəndə tid artıq list olur)."""
+    tid = entry.get("tid")
+    if isinstance(tid, list):
+        return tid
+    return [tid] if tid is not None else []
+
+
+def remember_message(state: dict, source: int, src_id: int, sent, edit_date):
+    """`sent` tək Message ola bilər, ya da (media+ayrı mətn bölündükdə) Message
+    siyahısı."""
+    ids = [m.id for m in sent] if isinstance(sent, list) else [sent.id]
     ch = get_channel_state(state, source)
     ch["msgs"][str(src_id)] = {
-        "tid": target_msg.id,
+        "tid": ids,
         "ed": edit_date.isoformat() if edit_date else None,
     }
     if len(ch["msgs"]) > MSG_MAP_MAX_SIZE:
@@ -334,10 +347,28 @@ async def send_safe(source_msg, final_text: str, entities, target: int, _retry: 
                                                            formatting_entities=entities)
                 return None
 
+            CAPTION_LIMIT = 1024
+            if final_text and len(final_text) > CAPTION_LIMIT:
+                # BUG FIX: [:1024] ilə kəsmək sözü ortadan qırırdı.
+                # İndi: şəkil/video başlıqsız göndərilir, tam mətn ayrıca mesajla arxadan gedir.
+                media_msg = await bot_client.send_file(
+                    target,
+                    file=temp_path,
+                    caption=None,
+                    force_document=False,
+                    voice_note=is_voice,
+                    video_note=is_round,
+                )
+                await asyncio.sleep(0.4)
+                text_msg = await bot_client.send_message(target, final_text, link_preview=True,
+                                                           formatting_entities=entities)
+                return [media_msg, text_msg]
+
             sent = await bot_client.send_file(
                 target,
                 file=temp_path,
-                caption=final_text[:1024] if final_text else None,
+                caption=final_text if final_text else None,
+                formatting_entities=entities,
                 force_document=False,
                 voice_note=is_voice,
                 video_note=is_round,
@@ -396,9 +427,11 @@ async def sync_edits_and_deletes(source: int, target: int, state: dict):
         if entry is None:
             continue
 
+        ids = tid_list(entry)
         if msg is None:
             try:
-                await bot_client.delete_messages(target, entry["tid"])
+                if ids:
+                    await bot_client.delete_messages(target, ids)
                 log.info(f"🗑️  Silindi (mənbə ID: {src_id})")
             except Exception as e:
                 log.info(f"❌ Silmə sinxronizasiya xətası (ID: {src_id}): {e}")
@@ -406,14 +439,15 @@ async def sync_edits_and_deletes(source: int, target: int, state: dict):
             continue
 
         new_ed = msg.edit_date.isoformat() if msg.edit_date else None
-        if new_ed != entry.get("ed"):
+        if new_ed != entry.get("ed") and ids:
             try:
                 text = clean_text(msg.text or "")
                 translated = translate_preserving_links(msg, text, src=src_lang) if text else ""
                 date_str = msg.date.astimezone(LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
                 final_text, entities = build_final_message(msg, translated, date_str, extra_suffix=" (redaktə edilib)")
                 if final_text:
-                    await bot_client.edit_message(target, entry["tid"], final_text, link_preview=True,
+                    # 2 mesaja bölünmüşsə (media+mətn), mətn olan SONUNCU mesaj redaktə olunur
+                    await bot_client.edit_message(target, ids[-1], final_text, link_preview=True,
                                                     formatting_entities=entities)
                     log.info(f"✏️  Redaktə sinxronlaşdırıldı (mənbə ID: {src_id})")
                 entry["ed"] = new_ed

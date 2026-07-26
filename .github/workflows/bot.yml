@@ -35,5 +35,26 @@ jobs:
           git config user.email "telegram-bot@users.noreply.github.com"
           git add state.json 2>/dev/null || true
           git diff --cached --quiet || git commit -m "state yeniləndi [skip ci]"
-          git pull --rebase --autostash || true
-          git push
+
+          # Konflikt olsa belə push-u zəmanətli etmək üçün: fetch + rebase, konflikt olarsa
+          # bu run-un öz (ən təzə) state.json-unu saxlayıb davam et, 5 dəfəyədək cəhd et.
+          success=0
+          for i in 1 2 3 4 5; do
+            git fetch origin main
+            if git rebase origin/main 2>/tmp/rebase.log; then
+              if git push origin HEAD:main; then
+                success=1
+                break
+              fi
+            else
+              echo "⚠️  Rebase konflikti — bu run-un state.json versiyası saxlanılır."
+              git checkout --theirs state.json 2>/dev/null || true
+              git add state.json
+              GIT_EDITOR=true git rebase --continue 2>/tmp/rebase2.log || git rebase --abort
+              git push origin HEAD:main && { success=1; break; }
+            fi
+            sleep 5
+          done
+          if [ "$success" != "1" ]; then
+            echo "❌ State push 5 cəhddən sonra da uğursuz oldu — növbəti run-da yenidən cəhd olunacaq."
+          fi

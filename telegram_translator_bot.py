@@ -12,7 +12,7 @@ from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from telethon.network import ConnectionTcpIntermediate
 from telethon.sessions import StringSession
-from telethon.helpers import add_surrogate
+from telethon.helpers import add_surrogate, del_surrogate
 from telethon.tl.types import MessageEntityCustomEmoji, DocumentAttributeVideo
 from zoneinfo import ZoneInfo
 
@@ -183,7 +183,7 @@ def build_final_message(msg, translated: str, date_str: str, extra_suffix: str =
         offset = len(base_surrogate) + 1
         pieces = []
         for char, doc_id in emojis:
-            pieces.append(char)
+            pieces.append(del_surrogate(char))
             length = len(char)
             entities.append(MessageEntityCustomEmoji(offset=offset, length=length, document_id=doc_id))
             offset += length + 1
@@ -623,6 +623,14 @@ async def process_channel(source: int, target: int, state: dict):
         if new_last is not None:
             ch["last_id"] = new_last
             save_state(state)
+        else:
+            # BUG FIX: uğursuz qrupdan sonrakılara keçmirik — last_id məhz bu
+            # nöqtədə saxlanılır ki, növbəti run dəqiq bu yerdən davam etsin.
+            # (əvvəllər sonrakı mesaj uğurlu olsaydı last_id onu ötüb keçirdi,
+            # uğursuz olan isə əbədilik itirilirdi.)
+            log.info(f"⏸️  Qrup (başlanğıc ID: {group[0].id}) uğursuz oldu — bu kanal üçün "
+                      f"bu run-da dayandırılır, növbəti run buradan davam edəcək.")
+            break
 
 
 async def main():

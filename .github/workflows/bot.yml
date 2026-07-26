@@ -11,7 +11,7 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 10   # BUG FIX: run 30 dəqiqəyə "asılıb qalırsa", indi 10-da özü kəsilir
+    timeout-minutes: 25   # ağır media (böyük video/GIF) olan kanallar üçün kifayət vaxt, amma hələ də əbədi asılı qalmır
     steps:
       - name: Checkout
         uses: actions/checkout@v4

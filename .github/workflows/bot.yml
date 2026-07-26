@@ -1,42 +1,33 @@
 name: Telegram Translator Bot
-
 on:
   schedule:
     - cron: '17,47 * * * *'
   workflow_dispatch:
-  repository_dispatch:
-    types: [trigger-bot]
-
 concurrency:
   group: telegram-bot
   cancel-in-progress: false
-
 permissions:
   contents: write
-
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 10   # BUG FIX: run 30 dəqiqəyə "asılıb qalırsa", indi 10-da özü kəsilir
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install dependencies
         run: |
           pip install telethon deep-translator
-
       - name: Run bot
         env:
           TG_SESSION: ${{ secrets.TG_SESSION }}
         run: python telegram_translator_bot.py
-
       - name: Persist state
         if: always()
         run: |

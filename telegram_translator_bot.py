@@ -39,7 +39,6 @@ CHANNELS = [
 ]
 SOURCE_LANG = {c["source"]: c.get("src", "auto") for c in CHANNELS}
 
-# === "QIZIL ORTA" — sürət vs spam qorxusu ===
 SEND_DELAY = 1.2
 MAX_FLOOD_RETRY = 2
 
@@ -47,7 +46,7 @@ FIRST_RUN_LOOKBACK_MINUTES = 15
 FIRST_RUN_MAX_MESSAGES = 50
 
 EDIT_SYNC_CHECK = 40
-MSG_MAP_MAX_SIZE = 300
+MSG_MAP_MAX_SIZE = 400
 
 MAX_CHUNK_CHARS = 3500
 CAPTION_LIMIT = 1024
@@ -63,12 +62,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Groq klienti (əgər API key varsa)
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 
 def _translate_groq(text: str, src: str) -> str:
-    """Groq Llama-3.3-70B modelindən istifadə edərək tərcümə edir."""
     if not groq_client:
         raise ValueError("GROQ_API_KEY tapılmadı.")
 
@@ -89,25 +86,27 @@ def _translate_groq(text: str, src: str) -> str:
         temperature=0.2,
         max_tokens=2048,
     )
-    return response.choices[0].message.content.strip()
+    res = response.choices[0].message.content.strip()
+    if not res:
+        raise ValueError("Groq qaytardığı cavab boşdur.")
+    return res
 
 
 def _translate_google(text: str, src: str) -> str:
     """Ehtiyat tərcüməçi (Google Translate)."""
-    last_err = None
+    source_lang = "auto" if not src or src == "auto" else src
     for attempt in range(2):
         try:
-            return GoogleTranslator(source=src, target="az").translate(text)
+            return GoogleTranslator(source=source_lang, target="az").translate(text)
         except Exception as e:
-            last_err = e
             if attempt == 0:
                 time.sleep(1.5)
-    log.info(f"❌ Google Translate xətası: {last_err}")
-    return text
+            else:
+                log.info(f"❌ Google Translate xətası: {e}")
+    return text  # Xəta olduqda botun çəkməməsi üçün orijinal mətni saxlayır
 
 
 def _translate_once(text: str, src: str) -> str:
-    """Əvvəlcə Groq API ilə tərcümə edir. Uğursuz olarsa avtomatik Google Translate-ə keçir."""
     if GROQ_API_KEY:
         try:
             return _translate_groq(text, src)
@@ -117,7 +116,6 @@ def _translate_once(text: str, src: str) -> str:
 
 
 def translate(text: str, src: str = "auto") -> str:
-    """Uzun mətnlər limitə görə hissə-hissə tərcümə olunur."""
     if not text:
         return ""
     if len(text) <= MAX_CHUNK_CHARS:
@@ -141,7 +139,7 @@ def translate(text: str, src: str = "auto") -> str:
     return "\n".join(translated_chunks)
 
 
-# ---------- LİNKLƏRİ QORUMA ----------
+# ---------- LİNKLƏRİ VƏ FORMATI QORUMA ----------
 URL_PATTERN = re.compile(r'(https?://\S+|www\.\S+)')
 
 
@@ -174,7 +172,6 @@ def extract_hidden_links(msg) -> list:
 
 
 def extract_custom_emojis(msg):
-    """Premium/custom emojiləri (görünən simvol + document_id) çıxarır."""
     result = []
     if getattr(msg, "entities", None) and msg.text:
         surrogate_text = add_surrogate(msg.text)
@@ -204,7 +201,6 @@ def translate_preserving_links(msg, text: str, src: str = "auto") -> str:
 
 
 def build_final_message(msg, translated: str, date_str: str, extra_suffix: str = ""):
-    """(mətn, formatting_entities) tuple-i qaytarır; premium emojilər sona əlavə olunur."""
     body = f"{translated}\n\n📅 {date_str}{extra_suffix}" if translated else ""
     if not body:
         return body, None
@@ -235,7 +231,7 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-# ---------- MEDİA METADATA ----------
+# ---------- MEDİA VƏ THUMBNAIL EMALI ----------
 def normalize_attrs(attrs):
     new_attrs = []
     for a in attrs:
@@ -276,7 +272,58 @@ def media_info(media):
     return ext, attrs
 
 
-# ---------- STATE (last_id + mesaj uyğunluq xəritəsi, JSON) ----------
+async def download_media_with_thumb(msg):
+    """Media faylını və əgər videodursa onun kover şəklini (thumbnail) endirir."""
+    media = _usable_media(msg)
+    if not media:
+        return None, None, None
+
+    ext, attrs = media_info(media)
+    temp_media = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+    media_path = temp_media.name
+    temp_media.close()
+
+    try:
+        downloaded = await user_client.download_media(media, file=media_path)
+        if not downloaded or not os.path.exists(media_path) or os.path.getsize(media_path) == 0:
+            if os.path.exists(media_path):
+                os.remove(media_path)
+            return None, None, None
+    except Exception as e:
+        log.info(f"⚠️ Media yükləmə xətası (ID: {msg.id}): {e}")
+        if os.path.exists(media_path):
+            try:
+                os.remove(media_path)
+            except Exception:
+                pass
+        return None, None, None
+
+    thumb_path = None
+    if type(media).__name__ == "MessageMediaDocument":
+        doc = getattr(media, 'document', None)
+        if doc and getattr(doc, 'thumbs', None):
+            try:
+                temp_thumb = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+                thumb_path = temp_thumb.name
+                temp_thumb.close()
+                downloaded_thumb = await user_client.download_media(doc.thumbs[-1], file=thumb_path)
+                if not downloaded_thumb or not os.path.exists(thumb_path) or os.path.getsize(thumb_path) == 0:
+                    if os.path.exists(thumb_path):
+                        os.remove(thumb_path)
+                    thumb_path = None
+            except Exception as e:
+                log.info(f"⚠️ Thumbnail yükləmə xətası: {e}")
+                if thumb_path and os.path.exists(thumb_path):
+                    try:
+                        os.remove(thumb_path)
+                    except Exception:
+                        pass
+                thumb_path = None
+
+    return media_path, thumb_path, attrs
+
+
+# ---------- STATE VƏ DUBİKATLARDAN QORUNMA ----------
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         try:
@@ -295,7 +342,9 @@ def save_state(state: dict):
 def get_channel_state(state: dict, source: int) -> dict:
     key = str(source)
     if key not in state:
-        state[key] = {"last_id": None, "msgs": {}}
+        state[key] = {"last_id": None, "msgs": {}, "groups": {}}
+    if "groups" not in state[key]:
+        state[key]["groups"] = {}
     return state[key]
 
 
@@ -318,28 +367,42 @@ def tid_list(entry: dict) -> list:
     return [tid] if tid is not None else []
 
 
-def remember_group(state: dict, source: int, group_ids: list, sent_ids: list, edit_date):
+def remember_group(state: dict, source: int, group_ids: list, sent_ids: list, edit_date, grouped_id=None):
     ch = get_channel_state(state, source)
     for gid in group_ids:
         ch["msgs"][str(gid)] = {
             "tid": sent_ids,
             "ed": edit_date.isoformat() if edit_date else None,
         }
+    if grouped_id:
+        ch["groups"][str(grouped_id)] = {
+            "tid": sent_ids,
+            "date": datetime.now(timezone.utc).isoformat()
+        }
+
     if len(ch["msgs"]) > MSG_MAP_MAX_SIZE:
         oldest = sorted(ch["msgs"].keys(), key=lambda x: int(x))[: len(ch["msgs"]) - MSG_MAP_MAX_SIZE]
         for k in oldest:
             del ch["msgs"][k]
 
+    if len(ch["groups"]) > MSG_MAP_MAX_SIZE:
+        oldest_g = list(ch["groups"].keys())[: len(ch["groups"]) - MSG_MAP_MAX_SIZE]
+        for k in oldest_g:
+            del ch["groups"][k]
 
-def already_sent(state: dict, source: int, src_id: int) -> bool:
+
+def already_sent(state: dict, source: int, msg_id: int, grouped_id=None) -> bool:
     ch = get_channel_state(state, source)
-    return str(src_id) in ch["msgs"]
+    if str(msg_id) in ch["msgs"]:
+        return True
+    if grouped_id and str(grouped_id) in ch["groups"]:
+        return True
+    return False
 
 
 if not TG_SESSION:
     raise SystemExit(
-        "❌ TG_SESSION tapılmadı. Əvvəlcə generate_session.py-i öz kompüterinizdə işə salıb "
-        "çıxan sətri GitHub Secrets-ə TG_SESSION adı ilə əlavə edin."
+        "❌ TG_SESSION tapılmadı. Əvvəlcə GitHub Secrets-ə TG_SESSION adı ilə əlavə edin."
     )
 
 user_client = TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH, connection=ConnectionTcpIntermediate)
@@ -371,27 +434,13 @@ def _usable_media(source_msg):
 async def send_safe(source_msg, final_text: str, entities, target: int, _retry: int = 0):
     web_url = _extract_web_url(source_msg)
     if web_url:
-        final_text = final_text + f"\n\n🔗 {web_url}"
-    media = _usable_media(source_msg)
-    temp_path = None
+        final_text = (final_text + f"\n\n🔗 {web_url}") if final_text else f"🔗 {web_url}"
+
+    media_path, thumb_path, attrs = await download_media_with_thumb(source_msg)
 
     try:
-        if media:
-            ext, attrs = media_info(media)
-            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-                temp_path = tmp.name
-
-            downloaded = await user_client.download_media(media, file=temp_path)
-
-            if not downloaded or not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
-                log.info(f"⚠️ Media endirilmədi (ID: {source_msg.id}), yalnız mətn göndərilir...")
-                if final_text:
-                    sent = await bot_client.send_message(target, final_text, link_preview=True,
-                                                         formatting_entities=entities)
-                    return sent
-                return None
-
-            size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+        if media_path:
+            size_mb = os.path.getsize(media_path) / (1024 * 1024)
             if size_mb > 49:
                 log.info(f"⚠️ Fayl çox böyükdür ({size_mb:.1f}MB), yalnız mətn göndərilir (ID: {source_msg.id})")
                 if final_text:
@@ -400,19 +449,21 @@ async def send_safe(source_msg, final_text: str, entities, target: int, _retry: 
                 return None
 
             if final_text and len(final_text) > CAPTION_LIMIT:
-                media_msg = await bot_client.send_file(target, file=temp_path, caption=None, attributes=attrs)
+                media_msg = await bot_client.send_file(
+                    target, file=media_path, thumb=thumb_path, caption=None, attributes=attrs, supports_streaming=True
+                )
                 await asyncio.sleep(0.4)
                 text_msg = await bot_client.send_message(target, final_text, link_preview=True,
                                                          formatting_entities=entities)
                 return [media_msg, text_msg]
 
             sent = await bot_client.send_file(
-                target, file=temp_path,
+                target, file=media_path, thumb=thumb_path,
                 caption=final_text if final_text else None,
                 formatting_entities=entities,
                 attributes=attrs,
+                supports_streaming=True
             )
-
         elif final_text:
             sent = await bot_client.send_message(target, final_text, link_preview=True,
                                                  formatting_entities=entities)
@@ -435,42 +486,43 @@ async def send_safe(source_msg, final_text: str, entities, target: int, _retry: 
         log.info(f"❌ XƏTA (ID: {source_msg.id}): {e}")
         return None
     finally:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
-
-
-async def send_album(group, final_text, entities, target):
-    temp_paths = []
-    attrs_list = []
-    try:
-        for m in group:
-            media = _usable_media(m)
-            if not media:
-                continue
-            ext, attrs = media_info(media)
-            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-                path = tmp.name
-            downloaded = await user_client.download_media(media, file=path)
-            if downloaded and os.path.exists(path) and os.path.getsize(path) > 0:
-                temp_paths.append(path)
-                attrs_list.append(attrs)
-            else:
+        for p in [media_path, thumb_path]:
+            if p and os.path.exists(p):
                 try:
-                    os.remove(path)
+                    os.remove(p)
                 except Exception:
                     pass
 
-        if not temp_paths:
+
+async def send_album(group, final_text, entities, target):
+    temp_items = []
+    file_paths = []
+    first_thumb = None
+
+    try:
+        for m in group:
+            m_path, t_path, attrs = await download_media_with_thumb(m)
+            if m_path:
+                temp_items.append((m_path, t_path))
+                file_paths.append(m_path)
+                if not first_thumb and t_path:
+                    first_thumb = t_path
+
+        if not file_paths:
             if final_text:
                 return await bot_client.send_message(target, final_text, link_preview=True,
                                                      formatting_entities=entities)
             return None
 
         short_caption = final_text if final_text and len(final_text) <= CAPTION_LIMIT else None
-        sent = await bot_client.send_file(target, file=temp_paths, caption=short_caption)
+
+        sent = await bot_client.send_file(
+            target, file=file_paths,
+            caption=short_caption,
+            formatting_entities=entities if short_caption else None,
+            thumb=first_thumb,
+            supports_streaming=True
+        )
         result = list(sent) if isinstance(sent, list) else [sent]
 
         if final_text and len(final_text) > CAPTION_LIMIT:
@@ -489,11 +541,13 @@ async def send_album(group, final_text, entities, target):
         log.info(f"❌ Albom göndərmə xətası: {e}")
         return None
     finally:
-        for p in temp_paths:
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+        for m_path, t_path in temp_items:
+            for p in [m_path, t_path]:
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
 
 
 def group_messages(messages):
@@ -517,12 +571,57 @@ def group_messages(messages):
     return groups
 
 
+async def fetch_and_group_messages(source: int, min_id: int, state: dict):
+    messages = []
+    async for msg in user_client.iter_messages(source, min_id=min_id, reverse=True):
+        if not msg.action and (msg.text or msg.media):
+            messages.append(msg)
+
+    if not messages:
+        return []
+
+    result_groups = []
+    now = datetime.now(timezone.utc)
+    i = 0
+    n = len(messages)
+
+    while i < n:
+        m = messages[i]
+        gid = getattr(m, "grouped_id", None)
+        if gid:
+            group = [m]
+            j = i + 1
+            while j < n and getattr(messages[j], "grouped_id", None) == gid:
+                group.append(messages[j])
+                j += 1
+
+            # Natamam albomları gözlətmək mexanizmi (15 saniyədən yeni mesajlar)
+            last_msg_in_group = group[-1]
+            age_sec = (now - last_msg_in_group.date).total_seconds()
+            if age_sec < 15 and j == n:
+                log.info(f"⏳ Qrup media (GroupedID: {gid}) hələ yüklənir, növbəti run-da emal ediləcək.")
+                break
+
+            result_groups.append(group)
+            i = j
+        else:
+            result_groups.append([m])
+            i += 1
+
+    return result_groups
+
+
 async def process_group(group, source: int, target: int, state: dict, src_lang: str):
     rep_id = group[0].id
-    if already_sent(state, source, rep_id):
+    gid = getattr(group[0], "grouped_id", None)
+
+    # Qrupdakı istənilən mesaj və ya grouped_id artıq işlənibsə, təkrar göndərilmir
+    if any(already_sent(state, source, m.id, getattr(m, "grouped_id", None)) for m in group):
+        log.info(f"⏭️ Artıq göndərilib, ötürülür (ID: {rep_id})")
         return group[-1].id
+
     try:
-        text_msg = next((m for m in group if m.text), group[0])
+        text_msg = next((m for m in group if m.text and m.text.strip()), group[0])
         text = clean_text(text_msg.text or "")
         translated = translate_preserving_links(text_msg, text, src=src_lang) if text else ""
         date_str = text_msg.date.astimezone(LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
@@ -533,16 +632,19 @@ async def process_group(group, source: int, target: int, state: dict, src_lang: 
         else:
             sent = await send_album(group, final_text, entities, target)
 
-        if sent:
-            group_ids = [m.id for m in group]
-            sent_ids = [m.id for m in sent] if isinstance(sent, list) else [sent.id]
-            remember_group(state, source, group_ids, sent_ids, text_msg.edit_date)
-            save_state(state)
-            await asyncio.sleep(SEND_DELAY)
-            return group[-1].id
+        group_ids = [m.id for m in group]
+        sent_ids = [m.id for m in sent] if isinstance(sent, list) else ([sent.id] if sent else [])
+
+        remember_group(state, source, group_ids, sent_ids, text_msg.edit_date, grouped_id=gid)
+        save_state(state)
+        await asyncio.sleep(SEND_DELAY)
+        return group[-1].id
+
     except Exception as e:
         log.info(f"❌ Mesaj emalı xətası (qrup başlanğıc ID: {rep_id}): {e}")
-    return None
+        remember_group(state, source, [m.id for m in group], [], group[0].edit_date, grouped_id=gid)
+        save_state(state)
+        return group[-1].id
 
 
 async def sync_edits_and_deletes(source: int, target: int, state: dict):
@@ -630,23 +732,15 @@ async def process_channel(source: int, target: int, state: dict):
                 save_state(state)
         return
 
-    messages = []
-    async for msg in user_client.iter_messages(source, min_id=last_id, reverse=True):
-        if not msg.action and (msg.text or msg.media):
-            messages.append(msg)
-
-    groups = group_messages(messages)
-    log.info(f"📋 {len(messages)} yeni mesaj tapıldı ({len(groups)} qrup, orijinal ardıcıllıqla).")
+    groups = await fetch_and_group_messages(source, last_id, state)
+    total_msgs = sum(len(g) for g in groups)
+    log.info(f"📋 {total_msgs} yeni mesaj tapıldı ({len(groups)} qrup, orijinal ardıcıllıqla).")
 
     for group in groups:
         new_last = await process_group(group, source, target, state, src_lang)
-        if new_last is not None:
+        if new_last is not None and new_last > (ch["last_id"] or 0):
             ch["last_id"] = new_last
             save_state(state)
-        else:
-            log.info(f"⏸️ Qrup (başlanğıc ID: {group[0].id}) uğursuz oldu — bu kanal üçün "
-                     f"bu run-da dayandırılır, növbəti run buradan davam edəcək.")
-            break
 
 
 async def main():

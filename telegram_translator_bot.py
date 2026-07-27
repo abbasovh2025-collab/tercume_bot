@@ -54,12 +54,11 @@ CAPTION_LIMIT = 1024
 STATE_FILE = "state.json"
 LEGACY_STATE_FILE = "last_ids.txt"
 
-# Alternative Groq Models for fallback
+# Stabil işləyən Groq modelləri
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",  # Əsas güclü model (70B)
-    "llama-3.1-8b-instant",     # Çox sürətli və yüksək limitli (8B)
-    "llama3-70b-8192",          # Ehtiyat 70B
-    "gemma2-9b-it"              # Google-un ehtiyat modeli
+    "llama-3.3-70b-versatile",  # Əsas güclü 70B model
+    "llama-3.1-8b-instant",     # Çox sürətli 8B model
+    "gemma2-9b-it"              # Google ehtiyat modeli
 ]
 # ==========================================
 
@@ -77,12 +76,15 @@ def _translate_groq(text: str, src: str) -> str:
     if not groq_client:
         raise ValueError("GROQ_API_KEY tapılmadı.")
 
+    src_lang_str = "Russian" if src == "ru" else ("English" if src == "en" else "the source language")
+
     system_prompt = (
-        "You are an expert translator. Translate the input text into natural, fluent Azerbaijani.\n"
+        f"You are an expert translator. Translate the given text from {src_lang_str} into natural, fluent Azerbaijani.\n"
         "STRICT RULES:\n"
         "1. Output ONLY the final Azerbaijani translation without any introductory or concluding text, notes, or explanations.\n"
         "2. Keep original line breaks, formatting, emojis, and special structure intact.\n"
-        "3. DO NOT change, translate, or remove link placeholders like XLINKX0X, XLINKX1X, etc."
+        "3. DO NOT change, translate, or remove link placeholders like XLINKX0X, XLINKX1X, etc.\n"
+        "4. ABSOLUTE MANDATE: You MUST output the translated text in Azerbaijani. NEVER return the original text in Russian/English!"
     )
 
     last_exc = None
@@ -98,13 +100,17 @@ def _translate_groq(text: str, src: str) -> str:
                 max_tokens=2048,
             )
             res = response.choices[0].message.content.strip()
-            if res:
+            
+            # SANITY CHECK: Cavabın boş olmadığını və orijinal mətnlə 100% eyni qalmadığını yoxlayırıq
+            if res and res.strip() != text.strip():
                 return res
+            else:
+                log.info(f"⚠️ Groq model ({model_name}) mətni tərcümə etmədi (orijinal qaldı). Növbəti model yoxlanılır...")
         except Exception as e:
             last_exc = e
             log.info(f"⚠️ Groq model ({model_name}) xətası: {e}. Növbəti model yoxlanılır...")
 
-    raise ValueError(f"Bütün Groq modelləri xəta verdi: {last_exc}")
+    raise ValueError(f"Bütün Groq modelləri xəta verdi və ya mətni tərcümə etmədi: {last_exc}")
 
 
 def _translate_google(text: str, src: str) -> str:
@@ -535,7 +541,6 @@ async def send_album(group, final_text, entities, target):
                                                      formatting_entities=entities)
             return None
 
-        # Mətni albomun üzərinə bərkitmək üçün CAPTION_LIMIT (1024) idarə olunur
         album_caption = None
         overflow_text = None
 
@@ -543,7 +548,6 @@ async def send_album(group, final_text, entities, target):
             if len(final_text) <= CAPTION_LIMIT:
                 album_caption = final_text
             else:
-                # Albom başlığında yerləşəcək hissə
                 cut_pos = final_text.rfind('\n', 0, 1000)
                 if cut_pos == -1:
                     cut_pos = final_text.rfind(' ', 0, 1000)
@@ -564,7 +568,6 @@ async def send_album(group, final_text, entities, target):
         )
         result = list(sent) if isinstance(sent, list) else [sent]
 
-        # Əgər mətn 1024 simvoldan böyük idisə, qalan hissə albomun altına göndərilir
         if overflow_text:
             await asyncio.sleep(0.4)
             overflow_msg = await bot_client.send_message(target, overflow_text, link_preview=True)
@@ -625,7 +628,6 @@ async def fetch_and_group_messages(source: int, min_id: int, state: dict):
     for group in groups:
         gid = getattr(group[0], "grouped_id", None)
         if gid:
-            # Yarımçıq albomların tam yüklənməsini gözləmək üçün
             last_msg_in_group = group[-1]
             age_sec = (now - last_msg_in_group.date).total_seconds()
             if age_sec < 15 and group == groups[-1]:

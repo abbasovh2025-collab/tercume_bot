@@ -6,6 +6,7 @@ import logging
 import re
 import tempfile
 import mimetypes
+from groq import Groq
 from deep_translator import GoogleTranslator
 from datetime import datetime, timezone, timedelta
 from telethon import TelegramClient
@@ -24,13 +25,9 @@ API_ID    = 39644223
 API_HASH  = "ceb32e1fd32532a6771756556cc617a2"
 BOT_TOKEN = "8759071197:AAHbp2Ivs64k6OgIXUcEvLO471tEOt6eMRs"
 
-# generate_session.py ilə BİR DƏFƏ yaradılıb GitHub Secrets-ə (TG_SESSION adı ilə)
-# əlavə olunmalıdır — bu olmadan CI-da interaktiv login mümkün deyil (EOFError).
 TG_SESSION = os.environ.get("TG_SESSION", "").strip()
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 
-# "src" — kanalın əsas dili. "auto" da işləyir, amma konkret dil yazsanız
-# (rus kanal üçün "ru", ingilis üçün "en") Google Translate-in kontekst
-# səhvləri xeyli azalır. Bilmirsinizsə "auto" saxlayın.
 CHANNELS = [
     {"source": -1001099250240, "target": -1003929029095, "src": "auto"},
     {"source": -1001111348665, "target": -1003996927324, "src": "auto"},
@@ -66,10 +63,37 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Groq klienti (əgər API key varsa)
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-def _translate_once(text: str, src: str) -> str:
-    """Google Translate-ə 1 sorğu — şəbəkə/rate-limit xətalarına görə 2 cəhd edir
-    (bug #6 fix: bəzi mesajlar tərcümə olunmadan orijinal dildə qalırdı)."""
+
+def _translate_groq(text: str, src: str) -> str:
+    """Groq Llama-3.3-70B modelindən istifadə edərək tərcümə edir."""
+    if not groq_client:
+        raise ValueError("GROQ_API_KEY tapılmadı.")
+
+    system_prompt = (
+        "You are an expert translator. Translate the input text into natural, fluent Azerbaijani.\n"
+        "STRICT RULES:\n"
+        "1. Output ONLY the final Azerbaijani translation without any introductory or concluding text, notes, or explanations.\n"
+        "2. Keep original line breaks, formatting, emojis, and special structure intact.\n"
+        "3. DO NOT change, translate, or remove link placeholders like XLINKX0X, XLINKX1X, etc."
+    )
+
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text}
+        ],
+        temperature=0.2,
+        max_tokens=2048,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def _translate_google(text: str, src: str) -> str:
+    """Ehtiyat tərcüməçi (Google Translate)."""
     last_err = None
     for attempt in range(2):
         try:
@@ -78,13 +102,22 @@ def _translate_once(text: str, src: str) -> str:
             last_err = e
             if attempt == 0:
                 time.sleep(1.5)
-    log.info(f"❌ Google Translate xətası (2 cəhddən sonra): {last_err}")
+    log.info(f"❌ Google Translate xətası: {last_err}")
     return text
 
 
+def _translate_once(text: str, src: str) -> str:
+    """Əvvəlcə Groq API ilə tərcümə edir. Uğursuz olarsa avtomatik Google Translate-ə keçir."""
+    if GROQ_API_KEY:
+        try:
+            return _translate_groq(text, src)
+        except Exception as e:
+            log.info(f"⚠️ Groq xətası ({e}), Google Translate-ə keçilir...")
+    return _translate_google(text, src)
+
+
 def translate(text: str, src: str = "auto") -> str:
-    """Uzun mətnlər limitə görə hissə-hissə tərcümə olunur ki, yarımçıq
-    kəsilmə baş verməsin."""
+    """Uzun mətnlər limitə görə hissə-hissə tərcümə olunur."""
     if not text:
         return ""
     if len(text) <= MAX_CHUNK_CHARS:
@@ -202,10 +235,8 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-# ---------- MEDİA METADATA (bug #1/#5 fix: GIF/video native atributları qorunur) ----------
+# ---------- MEDİA METADATA ----------
 def normalize_attrs(attrs):
-    """Video atributlarında supports_streaming məcburi True edilir ki,
-    Telegram-da video ilk vurmadan yüklənsin/oynasın."""
     new_attrs = []
     for a in attrs:
         if isinstance(a, DocumentAttributeVideo) and not getattr(a, 'supports_streaming', False):
@@ -220,9 +251,6 @@ def normalize_attrs(attrs):
 
 
 def media_info(media):
-    """(ext, attrs) qaytarır. attrs — orijinal Document-in atributlarıdır
-    (GIF/animasiya, video-stream, səsli-not, dairəvi video flag-ları daxil
-    olmaqla) ki, Telegram-da fayl orijinaldakı kimi render olunsun."""
     ext = ".tmp"
     attrs = None
     media_type = type(media).__name__
@@ -280,7 +308,7 @@ def migrate_legacy_state(state: dict):
                     k, v = line.split("=")
                     ch = get_channel_state(state, int(k))
                     ch["last_id"] = int(v)
-        log.info("♻️  Köhnə last_ids.txt formatından state.json-a keçirildi.")
+        log.info("♻️ Köhnə last_ids.txt formatından state.json-a keçirildi.")
 
 
 def tid_list(entry: dict) -> list:
@@ -291,8 +319,6 @@ def tid_list(entry: dict) -> list:
 
 
 def remember_group(state: dict, source: int, group_ids: list, sent_ids: list, edit_date):
-    """Bir albomun (və ya tək mesajın) BÜTÜN orijinal ID-lərini eyni hədəf
-    ID-siyahısına bağlayır — silmə/redaktə/idempotency bunun üzərindən işləyir."""
     ch = get_channel_state(state, source)
     for gid in group_ids:
         ch["msgs"][str(gid)] = {
@@ -358,26 +384,26 @@ async def send_safe(source_msg, final_text: str, entities, target: int, _retry: 
             downloaded = await user_client.download_media(media, file=temp_path)
 
             if not downloaded or not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
-                log.info(f"⚠️  Media endirilmədi (ID: {source_msg.id}), yalnız mətn göndərilir...")
+                log.info(f"⚠️ Media endirilmədi (ID: {source_msg.id}), yalnız mətn göndərilir...")
                 if final_text:
                     sent = await bot_client.send_message(target, final_text, link_preview=True,
-                                                           formatting_entities=entities)
+                                                         formatting_entities=entities)
                     return sent
                 return None
 
             size_mb = os.path.getsize(temp_path) / (1024 * 1024)
             if size_mb > 49:
-                log.info(f"⚠️  Fayl çox böyükdür ({size_mb:.1f}MB), yalnız mətn göndərilir (ID: {source_msg.id})")
+                log.info(f"⚠️ Fayl çox böyükdür ({size_mb:.1f}MB), yalnız mətn göndərilir (ID: {source_msg.id})")
                 if final_text:
                     return await bot_client.send_message(target, final_text, link_preview=True,
-                                                           formatting_entities=entities)
+                                                         formatting_entities=entities)
                 return None
 
             if final_text and len(final_text) > CAPTION_LIMIT:
                 media_msg = await bot_client.send_file(target, file=temp_path, caption=None, attributes=attrs)
                 await asyncio.sleep(0.4)
                 text_msg = await bot_client.send_message(target, final_text, link_preview=True,
-                                                           formatting_entities=entities)
+                                                         formatting_entities=entities)
                 return [media_msg, text_msg]
 
             sent = await bot_client.send_file(
@@ -389,9 +415,9 @@ async def send_safe(source_msg, final_text: str, entities, target: int, _retry: 
 
         elif final_text:
             sent = await bot_client.send_message(target, final_text, link_preview=True,
-                                                   formatting_entities=entities)
+                                                 formatting_entities=entities)
         else:
-            log.info(f"⚠️  Boş mesaj, ötürülür (ID: {source_msg.id})")
+            log.info(f"⚠️ Boş mesaj, ötürülür (ID: {source_msg.id})")
             return None
 
         log.info(f"✅ Göndərildi (ID: {source_msg.id}) | {datetime.now().strftime('%H:%M:%S')}")
@@ -417,8 +443,6 @@ async def send_safe(source_msg, final_text: str, entities, target: int, _retry: 
 
 
 async def send_album(group, final_text, entities, target):
-    """BUG #2/#3/#4 FIX: bir neçə şəkilli/videolu postu (album) TƏK qruplaşmış
-    mesaj kimi göndərir — hər biri ayrı-ayrı 4 dəfə getmək əvəzinə."""
     temp_paths = []
     attrs_list = []
     try:
@@ -442,7 +466,7 @@ async def send_album(group, final_text, entities, target):
         if not temp_paths:
             if final_text:
                 return await bot_client.send_message(target, final_text, link_preview=True,
-                                                       formatting_entities=entities)
+                                                     formatting_entities=entities)
             return None
 
         short_caption = final_text if final_text and len(final_text) <= CAPTION_LIMIT else None
@@ -452,7 +476,7 @@ async def send_album(group, final_text, entities, target):
         if final_text and len(final_text) > CAPTION_LIMIT:
             await asyncio.sleep(0.4)
             text_msg = await bot_client.send_message(target, final_text, link_preview=True,
-                                                       formatting_entities=entities)
+                                                     formatting_entities=entities)
             result.append(text_msg)
 
         return result
@@ -473,8 +497,6 @@ async def send_album(group, final_text, entities, target):
 
 
 def group_messages(messages):
-    """Ardıcıl mesajları grouped_id-ə görə albom halında qruplaşdırır
-    (orijinal kanaldakı kimi bir postda bir neçə şəkil/video)."""
     groups = []
     i = 0
     n = len(messages)
@@ -496,8 +518,6 @@ def group_messages(messages):
 
 
 async def process_group(group, source: int, target: int, state: dict, src_lang: str):
-    """Bir qrupu (tək mesaj və ya albom) tərcümə edib göndərir.
-    Uğurlu olarsa qrupun son mesaj ID-sini qaytarır (last_id irəlilətmək üçün)."""
     rep_id = group[0].id
     if already_sent(state, source, rep_id):
         return group[-1].id
@@ -538,7 +558,7 @@ async def sync_edits_and_deletes(source: int, target: int, state: dict):
     try:
         results = await user_client.get_messages(source, ids=ids_to_check)
     except Exception as e:
-        log.info(f"⚠️  Redaktə/silinmə yoxlaması alınmadı: {e}")
+        log.info(f"⚠️ Redaktə/silinmə yoxlaması alınmadı: {e}")
         return
 
     if not isinstance(results, list):
@@ -554,7 +574,7 @@ async def sync_edits_and_deletes(source: int, target: int, state: dict):
             try:
                 if ids:
                     await bot_client.delete_messages(target, ids)
-                log.info(f"🗑️  Silindi (mənbə ID: {src_id})")
+                log.info(f"🗑️ Silindi (mənbə ID: {src_id})")
             except Exception as e:
                 log.info(f"❌ Silmə sinxronizasiya xətası (ID: {src_id}): {e}")
             del ch["msgs"][str(src_id)]
@@ -569,8 +589,8 @@ async def sync_edits_and_deletes(source: int, target: int, state: dict):
                 final_text, entities = build_final_message(msg, translated, date_str, extra_suffix=" (redaktə edilib)")
                 if final_text:
                     await bot_client.edit_message(target, ids[-1], final_text, link_preview=True,
-                                                    formatting_entities=entities)
-                    log.info(f"✏️  Redaktə sinxronlaşdırıldı (mənbə ID: {src_id})")
+                                                  formatting_entities=entities)
+                    log.info(f"✏️ Redaktə sinxronlaşdırıldı (mənbə ID: {src_id})")
                 entry["ed"] = new_ed
             except Exception as e:
                 log.info(f"❌ Redaktə sinxronizasiya xətası (ID: {src_id}): {e}")
@@ -624,12 +644,8 @@ async def process_channel(source: int, target: int, state: dict):
             ch["last_id"] = new_last
             save_state(state)
         else:
-            # BUG FIX: uğursuz qrupdan sonrakılara keçmirik — last_id məhz bu
-            # nöqtədə saxlanılır ki, növbəti run dəqiq bu yerdən davam etsin.
-            # (əvvəllər sonrakı mesaj uğurlu olsaydı last_id onu ötüb keçirdi,
-            # uğursuz olan isə əbədilik itirilirdi.)
-            log.info(f"⏸️  Qrup (başlanğıc ID: {group[0].id}) uğursuz oldu — bu kanal üçün "
-                      f"bu run-da dayandırılır, növbəti run buradan davam edəcək.")
+            log.info(f"⏸️ Qrup (başlanğıc ID: {group[0].id}) uğursuz oldu — bu kanal üçün "
+                     f"bu run-da dayandırılır, növbəti run buradan davam edəcək.")
             break
 
 

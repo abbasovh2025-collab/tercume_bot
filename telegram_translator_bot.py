@@ -56,9 +56,10 @@ LEGACY_STATE_FILE = "last_ids.txt"
 
 # Alternative Groq Models for fallback
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-70b-versatile",
-    "mixtral-8x7b-32768"
+    "llama-3.3-70b-versatile",  # Əsas güclü model (70B)
+    "llama-3.1-8b-instant",     # Çox sürətli və yüksək limitli (8B)
+    "llama3-70b-8192",          # Ehtiyat 70B
+    "gemma2-9b-it"              # Google-un ehtiyat modeli
 ]
 # ==========================================
 

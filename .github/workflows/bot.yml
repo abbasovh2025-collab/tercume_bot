@@ -13,7 +13,7 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 25   # ağır media (böyük video/GIF) olan kanallar üçün kifayət vaxt, amma hələ də əbədi asılı qalmır
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,10 +25,11 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: |
-          pip install telethon deep-translator
+          pip install telethon deep-translator groq
       - name: Run bot
         env:
           TG_SESSION: ${{ secrets.TG_SESSION }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python telegram_translator_bot.py
       - name: Persist state
         if: always()
@@ -38,8 +39,6 @@ jobs:
           git add state.json 2>/dev/null || true
           git diff --cached --quiet || git commit -m "state yeniləndi [skip ci]"
 
-          # Konflikt olsa belə push-u zəmanətli etmək üçün: fetch + rebase, konflikt olarsa
-          # bu run-un öz (ən təzə) state.json-unu saxlayıb davam et, 5 dəfəyədək cəhd et.
           success=0
           for i in 1 2 3 4 5; do
             git fetch origin main
@@ -49,7 +48,7 @@ jobs:
                 break
               fi
             else
-              echo "⚠️  Rebase konflikti — bu run-un state.json versiyası saxlanılır."
+              echo "⚠️ Rebase konflikti — bu run-un state.json versiyası saxlanılır."
               git checkout --theirs state.json 2>/dev/null || true
               git add state.json
               GIT_EDITOR=true git rebase --continue 2>/tmp/rebase2.log || git rebase --abort

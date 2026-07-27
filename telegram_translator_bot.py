@@ -53,6 +53,13 @@ CAPTION_LIMIT = 1024
 
 STATE_FILE = "state.json"
 LEGACY_STATE_FILE = "last_ids.txt"
+
+# Alternative Groq Models for fallback
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-70b-versatile",
+    "mixtral-8x7b-32768"
+]
 # ==========================================
 
 logging.basicConfig(
@@ -77,19 +84,26 @@ def _translate_groq(text: str, src: str) -> str:
         "3. DO NOT change, translate, or remove link placeholders like XLINKX0X, XLINKX1X, etc."
     )
 
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": text}
-        ],
-        temperature=0.2,
-        max_tokens=2048,
-    )
-    res = response.choices[0].message.content.strip()
-    if not res:
-        raise ValueError("Groq qaytardığı cavab boşdur.")
-    return res
+    last_exc = None
+    for model_name in GROQ_MODELS:
+        try:
+            response = groq_client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": text}
+                ],
+                temperature=0.2,
+                max_tokens=2048,
+            )
+            res = response.choices[0].message.content.strip()
+            if res:
+                return res
+        except Exception as e:
+            last_exc = e
+            log.info(f"⚠️ Groq model ({model_name}) xətası: {e}. Növbəti model yoxlanılır...")
+
+    raise ValueError(f"Bütün Groq modelləri xəta verdi: {last_exc}")
 
 
 def _translate_google(text: str, src: str) -> str:
@@ -103,7 +117,7 @@ def _translate_google(text: str, src: str) -> str:
                 time.sleep(1.5)
             else:
                 log.info(f"❌ Google Translate xətası: {e}")
-    return text  # Xəta olduqda botun çəkməməsi üçün orijinal mətni saxlayır
+    return text
 
 
 def _translate_once(text: str, src: str) -> str:
@@ -235,7 +249,7 @@ def clean_text(text: str) -> str:
 def normalize_attrs(attrs):
     new_attrs = []
     for a in attrs:
-        if isinstance(a, DocumentAttributeVideo) and not getattr(a, 'supports_streaming', False):
+        if isinstance(a, DocumentAttributeVideo):
             new_attrs.append(DocumentAttributeVideo(
                 duration=a.duration, w=a.w, h=a.h,
                 round_message=getattr(a, 'round_message', False),
@@ -264,6 +278,10 @@ def media_info(media):
             mime = getattr(doc, 'mime_type', '')
             if filename:
                 ext = os.path.splitext(filename)[1] or '.tmp'
+            elif mime.startswith("video/"):
+                ext = ".mp4"
+            elif mime.startswith("image/"):
+                ext = ".jpg"
             elif mime:
                 ext = mimetypes.guess_extension(mime) or '.bin'
     elif media_type == "MessageMediaPhoto":
@@ -273,7 +291,7 @@ def media_info(media):
 
 
 async def download_media_with_thumb(msg):
-    """Media faylını və əgər videodursa onun kover şəklini (thumbnail) endirir."""
+    """Media faylını və video kover şəklini (thumbnail) endirir."""
     media = _usable_media(msg)
     if not media:
         return None, None, None
@@ -495,9 +513,11 @@ async def send_safe(source_msg, final_text: str, entities, target: int, _retry: 
 
 
 async def send_album(group, final_text, entities, target):
+    """3-4 fayldan ibarət albomu videoların atributlarını və koverlərin qoruyaraq göndərir."""
     temp_items = []
     file_paths = []
-    first_thumb = None
+    thumb_paths = []
+    attributes_list = []
 
     try:
         for m in group:
@@ -505,8 +525,8 @@ async def send_album(group, final_text, entities, target):
             if m_path:
                 temp_items.append((m_path, t_path))
                 file_paths.append(m_path)
-                if not first_thumb and t_path:
-                    first_thumb = t_path
+                thumb_paths.append(t_path)
+                attributes_list.append(attrs)
 
         if not file_paths:
             if final_text:
@@ -514,24 +534,43 @@ async def send_album(group, final_text, entities, target):
                                                      formatting_entities=entities)
             return None
 
-        short_caption = final_text if final_text and len(final_text) <= CAPTION_LIMIT else None
+        # Mətni albomun üzərinə bərkitmək üçün CAPTION_LIMIT (1024) idarə olunur
+        album_caption = None
+        overflow_text = None
+
+        if final_text:
+            if len(final_text) <= CAPTION_LIMIT:
+                album_caption = final_text
+            else:
+                # Albom başlığında yerləşəcək hissə
+                cut_pos = final_text.rfind('\n', 0, 1000)
+                if cut_pos == -1:
+                    cut_pos = final_text.rfind(' ', 0, 1000)
+                if cut_pos == -1:
+                    cut_pos = 1000
+
+                album_caption = final_text[:cut_pos] + "..."
+                overflow_text = "..." + final_text[cut_pos:]
 
         sent = await bot_client.send_file(
-            target, file=file_paths,
-            caption=short_caption,
-            formatting_entities=entities if short_caption else None,
-            thumb=first_thumb,
+            target,
+            file=file_paths,
+            caption=album_caption,
+            formatting_entities=entities if album_caption == final_text else None,
+            thumb=thumb_paths,
+            attributes=attributes_list,
             supports_streaming=True
         )
         result = list(sent) if isinstance(sent, list) else [sent]
 
-        if final_text and len(final_text) > CAPTION_LIMIT:
+        # Əgər mətn 1024 simvoldan böyük idisə, qalan hissə albomun altına göndərilir
+        if overflow_text:
             await asyncio.sleep(0.4)
-            text_msg = await bot_client.send_message(target, final_text, link_preview=True,
-                                                     formatting_entities=entities)
-            result.append(text_msg)
+            overflow_msg = await bot_client.send_message(target, overflow_text, link_preview=True)
+            result.append(overflow_msg)
 
         return result
+
     except FloodWaitError as e:
         wait_s = e.seconds + 2
         log.info(f"⏳ LIMIT (albom): {wait_s} saniyə gözlənilir...")
@@ -551,23 +590,21 @@ async def send_album(group, final_text, entities, target):
 
 
 def group_messages(messages):
+    """Bütün mesajları xronoloji ardıcıllıqla və `grouped_id` ilə dürüst qruplaşdırır."""
+    messages = sorted(messages, key=lambda x: x.id)
     groups = []
-    i = 0
-    n = len(messages)
-    while i < n:
-        m = messages[i]
+    group_map = {}
+
+    for m in messages:
         gid = getattr(m, "grouped_id", None)
         if gid:
-            group = [m]
-            j = i + 1
-            while j < n and getattr(messages[j], "grouped_id", None) == gid:
-                group.append(messages[j])
-                j += 1
-            groups.append(group)
-            i = j
+            if gid not in group_map:
+                group_map[gid] = []
+                groups.append(group_map[gid])
+            group_map[gid].append(m)
         else:
             groups.append([m])
-            i += 1
+
     return groups
 
 
@@ -580,33 +617,20 @@ async def fetch_and_group_messages(source: int, min_id: int, state: dict):
     if not messages:
         return []
 
-    result_groups = []
+    groups = group_messages(messages)
     now = datetime.now(timezone.utc)
-    i = 0
-    n = len(messages)
+    result_groups = []
 
-    while i < n:
-        m = messages[i]
-        gid = getattr(m, "grouped_id", None)
+    for group in groups:
+        gid = getattr(group[0], "grouped_id", None)
         if gid:
-            group = [m]
-            j = i + 1
-            while j < n and getattr(messages[j], "grouped_id", None) == gid:
-                group.append(messages[j])
-                j += 1
-
-            # Natamam albomları gözlətmək mexanizmi (15 saniyədən yeni mesajlar)
+            # Yarımçıq albomların tam yüklənməsini gözləmək üçün
             last_msg_in_group = group[-1]
             age_sec = (now - last_msg_in_group.date).total_seconds()
-            if age_sec < 15 and j == n:
+            if age_sec < 15 and group == groups[-1]:
                 log.info(f"⏳ Qrup media (GroupedID: {gid}) hələ yüklənir, növbəti run-da emal ediləcək.")
                 break
-
-            result_groups.append(group)
-            i = j
-        else:
-            result_groups.append([m])
-            i += 1
+        result_groups.append(group)
 
     return result_groups
 
@@ -615,7 +639,6 @@ async def process_group(group, source: int, target: int, state: dict, src_lang: 
     rep_id = group[0].id
     gid = getattr(group[0], "grouped_id", None)
 
-    # Qrupdakı istənilən mesaj və ya grouped_id artıq işlənibsə, təkrar göndərilmir
     if any(already_sent(state, source, m.id, getattr(m, "grouped_id", None)) for m in group):
         log.info(f"⏭️ Artıq göndərilib, ötürülür (ID: {rep_id})")
         return group[-1].id
@@ -715,7 +738,6 @@ async def process_channel(source: int, target: int, state: dict):
         async for msg in user_client.iter_messages(source, limit=FIRST_RUN_MAX_MESSAGES, reverse=False):
             if not msg.action and (msg.text or msg.media) and msg.date > cutoff:
                 messages.append(msg)
-        messages.reverse()
 
         last_sent_id = 0
         async for msg in user_client.iter_messages(source, limit=1):

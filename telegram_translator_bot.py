@@ -17,7 +17,6 @@ from telethon.helpers import add_surrogate, del_surrogate
 from telethon.tl.types import MessageEntityCustomEmoji, DocumentAttributeVideo
 from zoneinfo import ZoneInfo
 
-# Telegram mesajların vaxtını UTC saxlayır — çap edərkən Bakı vaxtına çeviririk
 LOCAL_TZ = ZoneInfo("Asia/Baku")
 
 # ==========================================
@@ -51,14 +50,17 @@ MSG_MAP_MAX_SIZE = 400
 MAX_CHUNK_CHARS = 3500
 CAPTION_LIMIT = 1024
 
+# BUG FIX: bir mesaj həmişəlik "itməsin" (skip olunmasın), amma korlanmış/poison
+# mesaj da bütün kanalı əbədi bloklamasın deyə — 3 cəhddən sonra vaz keçilir.
+MAX_MESSAGE_RETRIES = 3
+
 STATE_FILE = "state.json"
 LEGACY_STATE_FILE = "last_ids.txt"
 
-# Stabil işləyən Groq modelləri
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",  # Əsas güclü 70B model
-    "llama-3.1-8b-instant",     # Çox sürətli 8B model
-    "gemma2-9b-it"              # Google ehtiyat modeli
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "gemma2-9b-it",
 ]
 # ==========================================
 
@@ -71,6 +73,17 @@ log = logging.getLogger(__name__)
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
+CYRILLIC_RE = re.compile('[\u0400-\u04FF]')
+
+
+def _looks_azerbaijani(text: str) -> bool:
+    """BUG FIX: Groq bəzən mənbə dilində (rus/kiril) cavab qaytarırdı — bunu
+    aşkarlayıb rədd etmək və növbəti modelə keçmək üçün yoxlama."""
+    if not text or not text.strip():
+        return False
+    cyr = len(CYRILLIC_RE.findall(text))
+    return cyr < max(3, len(text) * 0.03)
+
 
 def _translate_groq(text: str, src: str) -> str:
     if not groq_client:
@@ -78,13 +91,24 @@ def _translate_groq(text: str, src: str) -> str:
 
     src_lang_str = "Russian" if src == "ru" else ("English" if src == "en" else "the source language")
 
+    # BUG FIX: köhnə təlimat söz-be-söz (hərfi) tərcüməyə meyilli idi, dolaşıq
+    # cümlələr qururdu. İndi "yenidən yaz, hərfi tərcümə etmə" tələbi aydın qoyulub.
     system_prompt = (
-        f"You are an expert translator. Translate the given text from {src_lang_str} into natural, fluent Azerbaijani.\n"
-        "STRICT RULES:\n"
-        "1. Output ONLY the final Azerbaijani translation without any introductory or concluding text, notes, or explanations.\n"
-        "2. Keep original line breaks, formatting, emojis, and special structure intact.\n"
-        "3. DO NOT change, translate, or remove link placeholders like XLINKX0X, XLINKX1X, etc.\n"
-        "4. ABSOLUTE MANDATE: You MUST output the translated text in Azerbaijani. NEVER return the original text in Russian/English!"
+        f"Sən Azərbaycanın APA, Trend, Report kimi xəbər agentliklərində işləyən peşəkar "
+        f"tərcüməçi-redaktorsan. Sənə verilən {src_lang_str} mətni Azərbaycan Respublikasının "
+        "standart ƏDƏBI Azərbaycan dilinə (Türkiyə türkcəsi DEYİL, rus dili qarışığı DEYİL) çevir.\n\n"
+        "QAYDALAR:\n"
+        "1. SÖZBƏSÖZ (hərfi) TƏRCÜMƏ ETMƏ. Əvvəlcə mənanı tam anla, sonra Azərbaycan dilinin "
+        "öz təbii söz sırası və cümlə quruluşu ilə (fel adətən cümlə sonunda) YENİDƏN YAZ.\n"
+        "2. Cümlələr qısa, aydın, təbii səslənməlidir — dolaşıq, uzun-uzadı, qeyri-təbii "
+        "konstruksiyalardan qəti qaçın.\n"
+        "3. Bütün mətn YALNIZ Azərbaycan dilində olmalıdır. Xüsusi adlar, coğrafi adlar və rəsmi "
+        "terminlər istisna olmaqla, orijinal dildə (rus/ingilis/kiril) heç bir söz və ya hərf qalmamalıdır.\n"
+        "4. Cavabında YALNIZ son tərcüməni ver — heç bir giriş sözü, izah, qeyd, dırnaq işarəsi əlavə etmə.\n"
+        "5. Orijinal sətir keçidlərini, emojiləri və ümumi formatı olduğu kimi saxla.\n"
+        "6. XLINKX0X, XLINKX1X kimi placeholder-lərə TOXUNMA, olduğu kimi saxla.\n"
+        "7. MÜTLƏQ QAYDA: cavab 100% Azərbaycan dilində olmalıdır. Orijinal dildə (rus/ingilis) "
+        "tək bir cümlə belə qaytarmaq QADAĞANDIR."
     )
 
     last_exc = None
@@ -100,17 +124,17 @@ def _translate_groq(text: str, src: str) -> str:
                 max_tokens=2048,
             )
             res = response.choices[0].message.content.strip()
-            
-            # SANITY CHECK: Cavabın boş olmadığını və orijinal mətnlə 100% eyni qalmadığını yoxlayırıq
-            if res and res.strip() != text.strip():
+
+            if res and res.strip() != text.strip() and _looks_azerbaijani(res):
                 return res
             else:
-                log.info(f"⚠️ Groq model ({model_name}) mətni tərcümə etmədi (orijinal qaldı). Növbəti model yoxlanılır...")
+                reason = "boş/eyni" if (not res or res.strip() == text.strip()) else "hələ orijinal dildə (kiril)"
+                log.info(f"⚠️ Groq model ({model_name}) uğursuz nəticə verdi ({reason}). Növbəti model yoxlanılır...")
         except Exception as e:
             last_exc = e
             log.info(f"⚠️ Groq model ({model_name}) xətası: {e}. Növbəti model yoxlanılır...")
 
-    raise ValueError(f"Bütün Groq modelləri xəta verdi və ya mətni tərcümə etmədi: {last_exc}")
+    raise ValueError(f"Bütün Groq modelləri xəta verdi və ya mətni düzgün tərcümə etmədi: {last_exc}")
 
 
 def _translate_google(text: str, src: str) -> str:
@@ -367,9 +391,11 @@ def save_state(state: dict):
 def get_channel_state(state: dict, source: int) -> dict:
     key = str(source)
     if key not in state:
-        state[key] = {"last_id": None, "msgs": {}, "groups": {}}
+        state[key] = {"last_id": None, "msgs": {}, "groups": {}, "retries": {}}
     if "groups" not in state[key]:
         state[key]["groups"] = {}
+    if "retries" not in state[key]:
+        state[key]["retries"] = {}
     return state[key]
 
 
@@ -399,6 +425,7 @@ def remember_group(state: dict, source: int, group_ids: list, sent_ids: list, ed
             "tid": sent_ids,
             "ed": edit_date.isoformat() if edit_date else None,
         }
+        ch["retries"].pop(str(gid), None)
     if grouped_id:
         ch["groups"][str(grouped_id)] = {
             "tid": sent_ids,
@@ -423,6 +450,13 @@ def already_sent(state: dict, source: int, msg_id: int, grouped_id=None) -> bool
     if grouped_id and str(grouped_id) in ch["groups"]:
         return True
     return False
+
+
+def bump_retry(state: dict, source: int, rep_id: int) -> int:
+    ch = get_channel_state(state, source)
+    key = str(rep_id)
+    ch["retries"][key] = ch["retries"].get(key, 0) + 1
+    return ch["retries"][key]
 
 
 if not TG_SESSION:
@@ -639,6 +673,8 @@ async def fetch_and_group_messages(source: int, min_id: int, state: dict):
 
 
 async def process_group(group, source: int, target: int, state: dict, src_lang: str):
+    """Qrupu tərcümə edib göndərir. Uğur/vaz-keçmə halında son mesaj ID-ni,
+    hələ retry ediləsi uğursuzluqda isə None qaytarır (bu run-da dayanılsın deyə)."""
     rep_id = group[0].id
     gid = getattr(group[0], "grouped_id", None)
 
@@ -658,8 +694,11 @@ async def process_group(group, source: int, target: int, state: dict, src_lang: 
         else:
             sent = await send_album(group, final_text, entities, target)
 
+        if not sent:
+            raise RuntimeError("Göndərmə uğursuz oldu (sent=None)")
+
         group_ids = [m.id for m in group]
-        sent_ids = [m.id for m in sent] if isinstance(sent, list) else ([sent.id] if sent else [])
+        sent_ids = [m.id for m in sent] if isinstance(sent, list) else [sent.id]
 
         remember_group(state, source, group_ids, sent_ids, text_msg.edit_date, grouped_id=gid)
         save_state(state)
@@ -668,9 +707,15 @@ async def process_group(group, source: int, target: int, state: dict, src_lang: 
 
     except Exception as e:
         log.info(f"❌ Mesaj emalı xətası (qrup başlanğıc ID: {rep_id}): {e}")
-        remember_group(state, source, [m.id for m in group], [], group[0].edit_date, grouped_id=gid)
+        attempts = bump_retry(state, source, rep_id)
+        if attempts >= MAX_MESSAGE_RETRIES:
+            log.info(f"🚫 (ID: {rep_id}) {MAX_MESSAGE_RETRIES} cəhddən sonra da uğursuz oldu — "
+                      f"həmişəlik ötürülür ki, digər mesajlar bloklanmasın.")
+            remember_group(state, source, [m.id for m in group], [], group[0].edit_date, grouped_id=gid)
+            save_state(state)
+            return group[-1].id
         save_state(state)
-        return group[-1].id
+        return None
 
 
 async def sync_edits_and_deletes(source: int, target: int, state: dict):
@@ -755,6 +800,8 @@ async def process_channel(source: int, target: int, state: dict):
             if new_last is not None and new_last > (ch["last_id"] or 0):
                 ch["last_id"] = new_last
                 save_state(state)
+            elif new_last is None:
+                break
         return
 
     groups = await fetch_and_group_messages(source, last_id, state)
@@ -766,6 +813,8 @@ async def process_channel(source: int, target: int, state: dict):
         if new_last is not None and new_last > (ch["last_id"] or 0):
             ch["last_id"] = new_last
             save_state(state)
+        elif new_last is None:
+            break
 
 
 async def main():

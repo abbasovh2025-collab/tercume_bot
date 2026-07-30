@@ -38,7 +38,7 @@ CHANNELS = [
 ]
 SOURCE_LANG = {c["source"]: c.get("src", "auto") for c in CHANNELS}
 
-SEND_DELAY = 1.2
+SEND_DELAY = 1.5
 MAX_FLOOD_RETRY = 2
 
 FIRST_RUN_LOOKBACK_MINUTES = 15
@@ -50,8 +50,6 @@ MSG_MAP_MAX_SIZE = 400
 MAX_CHUNK_CHARS = 3500
 CAPTION_LIMIT = 1024
 
-# BUG FIX: bir mesaj həmişəlik "itməsin" (skip olunmasın), amma korlanmış/poison
-# mesaj da bütün kanalı əbədi bloklamasın deyə — 3 cəhddən sonra vaz keçilir.
 MAX_MESSAGE_RETRIES = 3
 
 STATE_FILE = "state.json"
@@ -77,12 +75,25 @@ CYRILLIC_RE = re.compile('[\u0400-\u04FF]')
 
 
 def _looks_azerbaijani(text: str) -> bool:
-    """BUG FIX: Groq bəzən mənbə dilində (rus/kiril) cavab qaytarırdı — bunu
-    aşkarlayıb rədd etmək və növbəti modelə keçmək üçün yoxlama."""
     if not text or not text.strip():
         return False
     cyr = len(CYRILLIC_RE.findall(text))
     return cyr < max(3, len(text) * 0.03)
+
+
+def _clean_repetitions(text: str) -> str:
+    """Modellərin eyni абзац və ya cümləni təkrar-təkrar yazmasının qarşısını almaq üçün fallback təmizləyici."""
+    lines = text.split("\n")
+    cleaned_lines = []
+    seen = set()
+    for line in lines:
+        stripped = line.strip()
+        if len(stripped) > 20:
+            if stripped in seen:
+                continue
+            seen.add(stripped)
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines)
 
 
 def _translate_groq(text: str, src: str) -> str:
@@ -91,24 +102,15 @@ def _translate_groq(text: str, src: str) -> str:
 
     src_lang_str = "Russian" if src == "ru" else ("English" if src == "en" else "the source language")
 
-    # BUG FIX: köhnə təlimat söz-be-söz (hərfi) tərcüməyə meyilli idi, dolaşıq
-    # cümlələr qururdu. İndi "yenidən yaz, hərfi tərcümə etmə" tələbi aydın qoyulub.
     system_prompt = (
-        f"Sən Azərbaycanın APA, Trend, Report kimi xəbər agentliklərində işləyən peşəkar "
-        f"tərcüməçi-redaktorsan. Sənə verilən {src_lang_str} mətni Azərbaycan Respublikasının "
-        "standart ƏDƏBI Azərbaycan dilinə (Türkiyə türkcəsi DEYİL, rus dili qarışığı DEYİL) çevir.\n\n"
-        "QAYDALAR:\n"
-        "1. SÖZBƏSÖZ (hərfi) TƏRCÜMƏ ETMƏ. Əvvəlcə mənanı tam anla, sonra Azərbaycan dilinin "
-        "öz təbii söz sırası və cümlə quruluşu ilə (fel adətən cümlə sonunda) YENİDƏN YAZ.\n"
-        "2. Cümlələr qısa, aydın, təbii səslənməlidir — dolaşıq, uzun-uzadı, qeyri-təbii "
-        "konstruksiyalardan qəti qaçın.\n"
-        "3. Bütün mətn YALNIZ Azərbaycan dilində olmalıdır. Xüsusi adlar, coğrafi adlar və rəsmi "
-        "terminlər istisna olmaqla, orijinal dildə (rus/ingilis/kiril) heç bir söz və ya hərf qalmamalıdır.\n"
-        "4. Cavabında YALNIZ son tərcüməni ver — heç bir giriş sözü, izah, qeyd, dırnaq işarəsi əlavə etmə.\n"
-        "5. Orijinal sətir keçidlərini, emojiləri və ümumi formatı olduğu kimi saxla.\n"
-        "6. XLINKX0X, XLINKX1X kimi placeholder-lərə TOXUNMA, olduğu kimi saxla.\n"
-        "7. MÜTLƏQ QAYDA: cavab 100% Azərbaycan dilində olmalıdır. Orijinal dildə (rus/ingilis) "
-        "tək bir cümlə belə qaytarmaq QADAĞANDIR."
+        f"You are a master news editor and translator for top Azerbaijani media outlets (APA, Trend, Report).\n"
+        f"Translate the provided {src_lang_str} text into formal, high-quality, natural literary Azerbaijani.\n\n"
+        "TRANSLATION RULES:\n"
+        "1. DO NOT translate word-for-word. Adapt idioms, political terminology, and sentence structures naturally to Azerbaijani syntax (Subject-Object-Verb).\n"
+        "2. Keep sentences clear, concise, and executive in tone. Never produce repetitive sentences or loops.\n"
+        "3. Preserve entity names, official terms, and locations according to standard Azerbaijani journalistic guidelines.\n"
+        "4. DO NOT alter formatting tags like XLINKX0X, XLINKX1X, emojis, line breaks, or structural elements.\n"
+        "5. Output ONLY the finalized Azerbaijani text without any prefaces, quotes, notes, or explanations."
     )
 
     last_exc = None
@@ -120,15 +122,18 @@ def _translate_groq(text: str, src: str) -> str:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": text}
                 ],
-                temperature=0.2,
+                temperature=0.3,
+                frequency_penalty=0.5,  # Təkrar cümlələrin yaranmasının qarşısını alır
+                presence_penalty=0.3,   # Yeni fikirlərə keçidi təmin edir
                 max_tokens=2048,
             )
             res = response.choices[0].message.content.strip()
+            res = _clean_repetitions(res)
 
             if res and res.strip() != text.strip() and _looks_azerbaijani(res):
                 return res
             else:
-                reason = "boş/eyni" if (not res or res.strip() == text.strip()) else "hələ orijinal dildə (kiril)"
+                reason = "boş/eyni" if (not res or res.strip() == text.strip()) else "hələ orijinal dildədir"
                 log.info(f"⚠️ Groq model ({model_name}) uğursuz nəticə verdi ({reason}). Növbəti model yoxlanılır...")
         except Exception as e:
             last_exc = e
@@ -138,7 +143,6 @@ def _translate_groq(text: str, src: str) -> str:
 
 
 def _translate_google(text: str, src: str) -> str:
-    """Ehtiyat tərcüməçi (Google Translate)."""
     source_lang = "auto" if not src or src == "auto" else src
     for attempt in range(2):
         try:
@@ -322,7 +326,6 @@ def media_info(media):
 
 
 async def download_media_with_thumb(msg):
-    """Media faylını və video kover şəklini (thumbnail) endirir."""
     media = _usable_media(msg)
     if not media:
         return None, None, None
@@ -554,7 +557,6 @@ async def send_safe(source_msg, final_text: str, entities, target: int, _retry: 
 
 
 async def send_album(group, final_text, entities, target):
-    """3-4 fayldan ibarət albomu videoların atributlarını və koverlərin qoruyaraq göndərir."""
     temp_items = []
     file_paths = []
     thumb_paths = []
@@ -628,7 +630,6 @@ async def send_album(group, final_text, entities, target):
 
 
 def group_messages(messages):
-    """Bütün mesajları xronoloji ardıcıllıqla və `grouped_id` ilə dürüst qruplaşdırır."""
     messages = sorted(messages, key=lambda x: x.id)
     groups = []
     group_map = {}
@@ -673,8 +674,6 @@ async def fetch_and_group_messages(source: int, min_id: int, state: dict):
 
 
 async def process_group(group, source: int, target: int, state: dict, src_lang: str):
-    """Qrupu tərcümə edib göndərir. Uğur/vaz-keçmə halında son mesaj ID-ni,
-    hələ retry ediləsi uğursuzluqda isə None qaytarır (bu run-da dayanılsın deyə)."""
     rep_id = group[0].id
     gid = getattr(group[0], "grouped_id", None)
 
@@ -710,7 +709,7 @@ async def process_group(group, source: int, target: int, state: dict, src_lang: 
         attempts = bump_retry(state, source, rep_id)
         if attempts >= MAX_MESSAGE_RETRIES:
             log.info(f"🚫 (ID: {rep_id}) {MAX_MESSAGE_RETRIES} cəhddən sonra da uğursuz oldu — "
-                      f"həmişəlik ötürülür ki, digər mesajlar bloklanmasın.")
+                     f"həmişəlik ötürülür ki, digər mesajlar bloklanmasın.")
             remember_group(state, source, [m.id for m in group], [], group[0].edit_date, grouped_id=gid)
             save_state(state)
             return group[-1].id

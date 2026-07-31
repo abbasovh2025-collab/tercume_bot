@@ -6,6 +6,7 @@ import logging
 import re
 import tempfile
 import mimetypes
+from collections import Counter
 from groq import Groq
 from deep_translator import GoogleTranslator
 from datetime import datetime, timezone, timedelta
@@ -75,25 +76,46 @@ CYRILLIC_RE = re.compile('[\u0400-\u04FF]')
 
 
 def _looks_azerbaijani(text: str) -> bool:
+    """Söz-nisbəti əsasında yoxlayır ki, tərcümə hələ mənbə dilində (kiril) qalmasın."""
     if not text or not text.strip():
         return False
-    cyr = len(CYRILLIC_RE.findall(text))
-    return cyr < max(3, len(text) * 0.03)
+    words = text.split()
+    if not words:
+        return False
+    cyr_words = sum(1 for w in words if CYRILLIC_RE.search(w))
+    return (cyr_words / len(words)) < 0.05
 
 
-def _clean_repetitions(text: str) -> str:
-    """Modellərin eyni абзац və ya cümləni təkrar-təkrar yazmasının qarşısını almaq üçün fallback təmizləyici."""
-    lines = text.split("\n")
-    cleaned_lines = []
-    seen = set()
-    for line in lines:
-        stripped = line.strip()
-        if len(stripped) > 20:
-            if stripped in seen:
-                continue
-            seen.add(stripped)
-        cleaned_lines.append(line)
-    return "\n".join(cleaned_lines)
+def _has_repetition_loop(text: str) -> bool:
+    """BUG FIX: bəzi kiçik modellər tək bir sözü (məs. 'Məşhur Məşhur Məşhur...')
+    onlarla/yüzlərlə dəfə ardıcıl təkrarlayan degenerativ "dövr"ə düşür.
+    Bunu söz səviyyəsində aşkarlayıb rədd edirik ki, kanala getməsin."""
+    if not text:
+        return False
+    words = text.split()
+    if len(words) < 8:
+        return False
+
+    # 1) Ardıcıl eyni sözün 4+ dəfə təkrarı
+    run_len = 1
+    for i in range(1, len(words)):
+        w = words[i].strip('.,!?:;()[]«»"\'-').lower()
+        prev = words[i - 1].strip('.,!?:;()[]«»"\'-').lower()
+        if w and w == prev:
+            run_len += 1
+            if run_len >= 4:
+                return True
+        else:
+            run_len = 1
+
+    # 2) Bütün mətndə bir sözün qeyri-normal yüksək tezliyi
+    normalized = [w.strip('.,!?:;()[]«»"\'-').lower() for w in words if len(w) > 2]
+    if normalized:
+        _, freq = Counter(normalized).most_common(1)[0]
+        if freq >= 10 and freq / len(normalized) > 0.25:
+            return True
+
+    return False
 
 
 def _translate_groq(text: str, src: str) -> str:
@@ -107,37 +129,49 @@ def _translate_groq(text: str, src: str) -> str:
         f"Translate the provided {src_lang_str} text into formal, high-quality, natural literary Azerbaijani.\n\n"
         "TRANSLATION RULES:\n"
         "1. DO NOT translate word-for-word. Adapt idioms, political terminology, and sentence structures naturally to Azerbaijani syntax (Subject-Object-Verb).\n"
-        "2. Keep sentences clear, concise, and executive in tone. Never produce repetitive sentences or loops.\n"
+        "2. Keep sentences clear, concise, and executive in tone. Never produce repetitive sentences, repeated words, or loops of any kind.\n"
         "3. Preserve entity names, official terms, and locations according to standard Azerbaijani journalistic guidelines.\n"
         "4. DO NOT alter formatting tags like XLINKX0X, XLINKX1X, emojis, line breaks, or structural elements.\n"
-        "5. Output ONLY the finalized Azerbaijani text without any prefaces, quotes, notes, or explanations."
+        "5. Output ONLY the finalized Azerbaijani text without any prefaces, quotes, notes, or explanations.\n"
+        "6. If unsure how to translate a word or number precisely, write your best single attempt and move on — "
+        "NEVER repeat the same word or phrase multiple times in a row."
     )
 
     last_exc = None
     for model_name in GROQ_MODELS:
-        try:
-            response = groq_client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": text}
-                ],
-                temperature=0.3,
-                frequency_penalty=0.5,  # Təkrar cümlələrin yaranmasının qarşısını alır
-                presence_penalty=0.3,   # Yeni fikirlərə keçidi təmin edir
-                max_tokens=2048,
-            )
-            res = response.choices[0].message.content.strip()
-            res = _clean_repetitions(res)
+        # Hər model üçün 2 cəhd — 1-ci cəhd degenerativ (təkrarlanan) çıxsa,
+        # eyni modeli bir az fərqli temperaturla bir daha sınayır, sonra növbəti modelə keçir.
+        for sub_attempt in range(2):
+            try:
+                response = groq_client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": text}
+                    ],
+                    temperature=0.3 + (sub_attempt * 0.15),
+                    frequency_penalty=0.6,
+                    presence_penalty=0.4,
+                    max_tokens=3000,
+                )
+                res = response.choices[0].message.content.strip()
 
-            if res and res.strip() != text.strip() and _looks_azerbaijani(res):
-                return res
-            else:
-                reason = "boş/eyni" if (not res or res.strip() == text.strip()) else "hələ orijinal dildədir"
-                log.info(f"⚠️ Groq model ({model_name}) uğursuz nəticə verdi ({reason}). Növbəti model yoxlanılır...")
-        except Exception as e:
-            last_exc = e
-            log.info(f"⚠️ Groq model ({model_name}) xətası: {e}. Növbəti model yoxlanılır...")
+                if (res and res.strip() != text.strip()
+                        and _looks_azerbaijani(res)
+                        and not _has_repetition_loop(res)):
+                    return res
+
+                if not res or res.strip() == text.strip():
+                    reason = "boş/eyni"
+                elif _has_repetition_loop(res):
+                    reason = "təkrarlama dövrünə düşüb (zibil mətn)"
+                else:
+                    reason = "hələ orijinal dildədir"
+                log.info(f"⚠️ Groq model ({model_name}, cəhd {sub_attempt + 1}) uğursuz nəticə verdi ({reason}).")
+            except Exception as e:
+                last_exc = e
+                log.info(f"⚠️ Groq model ({model_name}, cəhd {sub_attempt + 1}) xətası: {e}.")
+        log.info("➡️ Növbəti model yoxlanılır...")
 
     raise ValueError(f"Bütün Groq modelləri xəta verdi və ya mətni düzgün tərcümə etmədi: {last_exc}")
 

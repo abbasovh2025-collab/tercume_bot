@@ -200,12 +200,21 @@ def _translate_google(text: str, src: str) -> str:
 
 
 def _translate_once(text: str, src: str) -> str:
+    # İNDİ ƏSAS: Google (TR körpüsü ilə). Groq saxlanılır, amma yalnız Google
+    # tam uğursuz olsa (nəticə boş/orijinalla eyni qalsa) işə düşür.
+    try:
+        result = _translate_google(text, src)
+        if result and result.strip() != text.strip():
+            return result
+    except Exception as e:
+        log.info(f"⚠️ Google xətası ({e}), Groq-a keçilir...")
+
     if GROQ_API_KEY:
         try:
             return _translate_groq(text, src)
         except Exception as e:
-            log.info(f"⚠️ Groq xətası ({e}), Google Translate-ə keçilir...")
-    return _translate_google(text, src)
+            log.info(f"⚠️ Groq xətası ({e})")
+    return text
 
 
 def translate(text: str, src: str = "auto") -> str:

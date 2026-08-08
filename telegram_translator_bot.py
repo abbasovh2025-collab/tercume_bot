@@ -124,17 +124,13 @@ def _translate_groq(text: str, src: str) -> str:
 
     src_lang_str = "Russian" if src == "ru" else ("English" if src == "en" else "the source language")
 
+    # QISALDILDI: bu mətn HƏR TƏK sorğuda göndərilir (sabit overhead) — nə qədər
+    # uzun olsa, gündəlik token limiti bir o qədər tez dolur. Qısa amma effektiv saxlanıldı.
     system_prompt = (
-        f"You are a master news editor and translator for top Azerbaijani media outlets (APA, Trend, Report).\n"
-        f"Translate the provided {src_lang_str} text into formal, high-quality, natural literary Azerbaijani.\n\n"
-        "TRANSLATION RULES:\n"
-        "1. DO NOT translate word-for-word. Adapt idioms, political terminology, and sentence structures naturally to Azerbaijani syntax (Subject-Object-Verb).\n"
-        "2. Keep sentences clear, concise, and executive in tone. Never produce repetitive sentences, repeated words, or loops of any kind.\n"
-        "3. Preserve entity names, official terms, and locations according to standard Azerbaijani journalistic guidelines.\n"
-        "4. DO NOT alter formatting tags like XLINKX0X, XLINKX1X, emojis, line breaks, or structural elements.\n"
-        "5. Output ONLY the finalized Azerbaijani text without any prefaces, quotes, notes, or explanations.\n"
-        "6. If unsure how to translate a word or number precisely, write your best single attempt and move on — "
-        "NEVER repeat the same word or phrase multiple times in a row."
+        f"Translate {src_lang_str} text into natural, formal Azerbaijani (news style, APA/Trend/Report).\n"
+        "Rules: rewrite naturally (no word-for-word translation, proper Azerbaijani syntax); "
+        "never repeat words/sentences; keep XLINKX0X-style placeholders, emojis and line breaks unchanged; "
+        "output ONLY the translation, nothing else."
     )
 
     last_exc = None
@@ -152,7 +148,7 @@ def _translate_groq(text: str, src: str) -> str:
                     temperature=0.3 + (sub_attempt * 0.15),
                     frequency_penalty=0.6,
                     presence_penalty=0.4,
-                    max_tokens=3000,
+                    max_tokens=1500,  # QISALDILDI (3000 -> 1500): limiti daha tez doldururdu
                 )
                 res = response.choices[0].message.content.strip()
 
@@ -177,7 +173,21 @@ def _translate_groq(text: str, src: str) -> str:
 
 
 def _translate_google(text: str, src: str) -> str:
+    """Google-un Azərbaycan dili dəstəyi türk dilindən zəifdir (az data ilə
+    öyrədilib). Ona görə əvvəlcə TÜRK dilinə (Google-da çox güclü), sonra
+    türkcədən Azərbaycan dilinə (qohum dillər — daha keyfiyyətli keçid)
+    "körpü" ilə tərcümə edirik. Alınmasa birbaşa AZ-a keçirik."""
     source_lang = "auto" if not src or src == "auto" else src
+
+    try:
+        via_tr = GoogleTranslator(source=source_lang, target="tr").translate(text)
+        if via_tr and via_tr.strip():
+            az = GoogleTranslator(source="tr", target="az").translate(via_tr)
+            if az and az.strip():
+                return az
+    except Exception as e:
+        log.info(f"⚠️ Google (TR körpü) xətası: {e}, birbaşa AZ-a keçilir...")
+
     for attempt in range(2):
         try:
             return GoogleTranslator(source=source_lang, target="az").translate(text)

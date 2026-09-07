@@ -61,6 +61,11 @@ GROQ_MODELS = [
     "llama-3.1-8b-instant",
     "gemma2-9b-it",
 ]
+
+# BUG FIX: server/şəbəkə xətalarının hansı açar sözlərlə tanınacağı (500-cü tip
+# keçici xətalar üçün — bunlar əvvəllər heç gözləmədən vaz keçilirdi).
+TRANSIENT_ERROR_HINTS = ("500", "502", "503", "504", "server error", "internalservererror",
+                          "timeout", "timed out", "connection", "temporarily")
 # ==========================================
 
 logging.basicConfig(
@@ -87,16 +92,14 @@ def _looks_azerbaijani(text: str) -> bool:
 
 
 def _has_repetition_loop(text: str) -> bool:
-    """BUG FIX: bəzi kiçik modellər tək bir sözü (məs. 'Məşhur Məşhur Məşhur...')
-    onlarla/yüzlərlə dəfə ardıcıl təkrarlayan degenerativ "dövr"ə düşür.
-    Bunu söz səviyyəsində aşkarlayıb rədd edirik ki, kanala getməsin."""
+    """Bəzi kiçik modellər tək bir sözü onlarla/yüzlərlə dəfə ardıcıl təkrarlayan
+    degenerativ "dövr"ə düşür. Bunu söz səviyyəsində aşkarlayıb rədd edirik."""
     if not text:
         return False
     words = text.split()
     if len(words) < 8:
         return False
 
-    # 1) Ardıcıl eyni sözün 4+ dəfə təkrarı
     run_len = 1
     for i in range(1, len(words)):
         w = words[i].strip('.,!?:;()[]«»"\'-').lower()
@@ -108,7 +111,6 @@ def _has_repetition_loop(text: str) -> bool:
         else:
             run_len = 1
 
-    # 2) Bütün mətndə bir sözün qeyri-normal yüksək tezliyi
     normalized = [w.strip('.,!?:;()[]«»"\'-').lower() for w in words if len(w) > 2]
     if normalized:
         _, freq = Counter(normalized).most_common(1)[0]
@@ -124,8 +126,6 @@ def _translate_groq(text: str, src: str) -> str:
 
     src_lang_str = "Russian" if src == "ru" else ("English" if src == "en" else "the source language")
 
-    # QISALDILDI: bu mətn HƏR TƏK sorğuda göndərilir (sabit overhead) — nə qədər
-    # uzun olsa, gündəlik token limiti bir o qədər tez dolur. Qısa amma effektiv saxlanıldı.
     system_prompt = (
         f"Translate {src_lang_str} text into natural, formal Azerbaijani (news style, APA/Trend/Report).\n"
         "Rules: rewrite naturally (no word-for-word translation, proper Azerbaijani syntax); "
@@ -135,8 +135,6 @@ def _translate_groq(text: str, src: str) -> str:
 
     last_exc = None
     for model_name in GROQ_MODELS:
-        # Hər model üçün 2 cəhd — 1-ci cəhd degenerativ (təkrarlanan) çıxsa,
-        # eyni modeli bir az fərqli temperaturla bir daha sınayır, sonra növbəti modelə keçir.
         for sub_attempt in range(2):
             try:
                 response = groq_client.chat.completions.create(
@@ -148,7 +146,7 @@ def _translate_groq(text: str, src: str) -> str:
                     temperature=0.3 + (sub_attempt * 0.15),
                     frequency_penalty=0.6,
                     presence_penalty=0.4,
-                    max_tokens=1500,  # QISALDILDI (3000 -> 1500): limiti daha tez doldururdu
+                    max_tokens=1500,
                 )
                 res = response.choices[0].message.content.strip()
 
@@ -173,10 +171,8 @@ def _translate_groq(text: str, src: str) -> str:
 
 
 def _translate_google(text: str, src: str) -> str:
-    """Google-un Azərbaycan dili dəstəyi türk dilindən zəifdir (az data ilə
-    öyrədilib). Ona görə əvvəlcə TÜRK dilinə (Google-da çox güclü), sonra
-    türkcədən Azərbaycan dilinə (qohum dillər — daha keyfiyyətli keçid)
-    "körpü" ilə tərcümə edirik. Alınmasa birbaşa AZ-a keçirik."""
+    """Google-un Azərbaycan dili dəstəyi türk dilindən zəifdir. Ona görə əvvəlcə
+    TÜRK dilinə, sonra türkcədən Azərbaycan dilinə "körpü" ilə tərcümə edirik."""
     source_lang = "auto" if not src or src == "auto" else src
 
     try:
@@ -200,8 +196,6 @@ def _translate_google(text: str, src: str) -> str:
 
 
 def _translate_once(text: str, src: str) -> str:
-    # İNDİ ƏSAS: Google (TR körpüsü ilə). Groq saxlanılır, amma yalnız Google
-    # tam uğursuz olsa (nəticə boş/orijinalla eyni qalsa) işə düşür.
     try:
         result = _translate_google(text, src)
         if result and result.strip() != text.strip():
@@ -295,6 +289,12 @@ def translate_preserving_links(msg, text: str, src: str = "auto") -> str:
     protected, urls = protect_urls(text)
     translated = translate(protected, src=src)
     translated = restore_urls(translated, urls)
+
+    # BUG FIX: əvvəllər tərcümə "uğursuz" olub (nəticə orijinalla eyni qalıb)
+    # sakitcə orijinal dildə göndərilirdi. İndi bu, XƏTA sayılır ki, avtomatik
+    # retry mexanizmi (3 cəhd) işə düşsün, mesaj tərcüməsiz "sızmasın".
+    if translated.strip() == text.strip():
+        raise RuntimeError("Tərcümə uğursuz oldu — nəticə orijinal mətnlə eyni qaldı.")
 
     hidden = [u for u in extract_hidden_links(msg) if u not in urls]
     if hidden:
@@ -546,6 +546,13 @@ def _usable_media(source_msg):
     return media
 
 
+def _is_transient_error(e: Exception) -> bool:
+    """BUG FIX: Telegram-ın keçici 500-cü tip server xətalarını tanıyır ki,
+    dərhal vaz keçmək əvəzinə qısa gözləyib yenidən cəhd etsin."""
+    s = str(e).lower()
+    return any(hint in s for hint in TRANSIENT_ERROR_HINTS)
+
+
 async def send_safe(source_msg, final_text: str, entities, target: int, _retry: int = 0):
     web_url = _extract_web_url(source_msg)
     if web_url:
@@ -598,6 +605,11 @@ async def send_safe(source_msg, final_text: str, entities, target: int, _retry: 
         log.info(f"❌ Flood limiti dəfələrlə keçdi, mesaj ötürüldü (ID: {source_msg.id})")
         return None
     except Exception as e:
+        if _is_transient_error(e) and _retry < MAX_FLOOD_RETRY:
+            wait_s = 5 * (_retry + 1)
+            log.info(f"⏳ Keçici server xətası ({e}), {wait_s}s sonra yenidən cəhd ({_retry + 1})...")
+            await asyncio.sleep(wait_s)
+            return await send_safe(source_msg, final_text, entities, target, _retry=_retry + 1)
         log.info(f"❌ XƏTA (ID: {source_msg.id}): {e}")
         return None
     finally:
@@ -609,7 +621,7 @@ async def send_safe(source_msg, final_text: str, entities, target: int, _retry: 
                     pass
 
 
-async def send_album(group, final_text, entities, target):
+async def send_album(group, final_text, entities, target, _retry: int = 0):
     temp_items = []
     file_paths = []
     thumb_paths = []
@@ -670,6 +682,11 @@ async def send_album(group, final_text, entities, target):
         await asyncio.sleep(wait_s)
         return None
     except Exception as e:
+        if _is_transient_error(e) and _retry < MAX_FLOOD_RETRY:
+            wait_s = 5 * (_retry + 1)
+            log.info(f"⏳ Albomda keçici server xətası ({e}), {wait_s}s sonra yenidən cəhd ({_retry + 1})...")
+            await asyncio.sleep(wait_s)
+            return await send_album(group, final_text, entities, target, _retry=_retry + 1)
         log.info(f"❌ Albom göndərmə xətası: {e}")
         return None
     finally:

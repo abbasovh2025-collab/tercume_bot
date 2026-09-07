@@ -4,8 +4,6 @@ on:
   schedule:
     - cron: '17,47 * * * *'
   workflow_dispatch:
-  repository_dispatch:
-    types: [trigger-bot]
 
 concurrency:
   group: telegram-bot
@@ -63,8 +61,12 @@ jobs:
                 break
               fi
             else
-              echo "⚠️ Rebase konflikti — bu run-un state.json versiyası saxlanılır."
-              git checkout --theirs state.json 2>/dev/null || true
+              # BUG FIX: əvvəllər burada "--theirs" ilə bir tərəf tam atılırdı —
+              # bu, digər run-un uğurla göndərdiyi mesajların qeydini silib
+              # TƏKRAR GÖNDƏRİLMƏYƏ səbəb olurdu. İndi iki versiya PROFESSIONAL
+              # şəkildə birləşdirilir (heç bir tərəfin qeydi itmir).
+              echo "⚠️ Rebase konflikti — state.json professional merge edilir."
+              python merge_state.py
               git add state.json
               GIT_EDITOR=true git rebase --continue 2>/tmp/rebase2.log || git rebase --abort
               git push origin HEAD:main && { success=1; break; }
